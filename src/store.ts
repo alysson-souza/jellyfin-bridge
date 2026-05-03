@@ -241,6 +241,26 @@ export class Store {
       .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
   }
 
+  findIndexedItemsBySourceId(itemId: string): IndexedItemRecord[] {
+    const rows = this.db.prepare("SELECT * FROM indexed_items WHERE item_id = ? ORDER BY server_id, library_id, item_id").all(itemId) as Row[];
+    return rows
+      .map(indexedItemFromRow)
+      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
+  }
+
+  removeIndexedItem(serverId: string, itemId: string): void {
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM indexed_items WHERE server_id = ? AND item_id = ?").run(serverId, itemId);
+      this.db.prepare("DELETE FROM media_source_mappings WHERE server_id = ? AND upstream_item_id = ?").run(serverId, itemId);
+      this.db.prepare("DELETE FROM playback_sessions WHERE server_id = ? AND upstream_item_id = ?").run(serverId, itemId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   upsertMediaSourceMapping(mapping: MediaSourceMapping): void {
     this.db.prepare(`
       INSERT INTO media_source_mappings (bridge_media_source_id, server_id, upstream_item_id, upstream_media_source_id)

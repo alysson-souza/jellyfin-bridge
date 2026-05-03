@@ -178,13 +178,109 @@ test("returns explicit unsupported response instead of upstream passthrough", as
     { method: "GET", url: "/Packages" },
     { method: "GET", url: "/LiveTv/Channels" },
     { method: "POST", url: "/QuickConnect/Initiate" },
-    { method: "POST", url: "/SyncPlay/NewGroup" },
-    { method: "DELETE", url: "/Items/item-a" }
+    { method: "POST", url: "/SyncPlay/NewGroup" }
   ] as const) {
     const unsupportedResponse = await app.inject(request);
     assert.equal(unsupportedResponse.statusCode, 501, `${request.method} ${request.url}`);
     assert.equal(unsupportedResponse.json().title, "Not Implemented");
   }
+
+  await app.close();
+  store.close();
+});
+
+test("deletes indexed items through the resolved upstream source", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" }, MediaSources: [{ Id: "source-main", ItemId: "main-alien" }] }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-alien",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "remote-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" }, MediaSources: [{ Id: "source-remote", ItemId: "remote-alien" }] }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-thing",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:tmdb:1091",
+    json: { Id: "remote-thing", Type: "Movie", Name: "The Thing", ProviderIds: { Tmdb: "1091" } }
+  });
+  store.upsertMediaSourceMapping({
+    bridgeMediaSourceId: "remote-thing-source",
+    serverId: "remote",
+    upstreamItemId: "remote-thing",
+    upstreamMediaSourceId: "source-thing"
+  });
+  const playbackSession = store.createPlaybackSessionMapping({
+    serverId: "remote",
+    upstreamPlaySessionId: "upstream-play-session",
+    upstreamItemId: "remote-thing",
+    bridgeItemId: bridgeItemId("movie:tmdb:1091")
+  });
+
+  const upstream = new FakeUpstream({});
+  upstream.rawResponses["remote:/Items/remote-thing"] = { statusCode: 204, headers: {}, body: "" };
+  upstream.rawResponses["main:/Items/main-alien"] = { statusCode: 204, headers: {}, body: "" };
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const token = login.json().AccessToken;
+
+  const upstreamIdDelete = await app.inject({
+    method: "DELETE",
+    url: "/Items/remote-thing",
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(upstreamIdDelete.statusCode, 204);
+  assert.equal(upstreamIdDelete.body, "");
+  assert.deepEqual(upstream.rawRequests[0], {
+    serverId: "remote",
+    path: "/Items/remote-thing",
+    init: { method: "DELETE" },
+    headers: {}
+  });
+  assert.equal(store.listIndexedItems().some((item) => item.serverId === "remote" && item.itemId === "remote-thing"), false);
+  assert.equal(store.findMediaSourceMapping("remote-thing-source"), undefined);
+  assert.equal(store.findPlaybackSessionMapping(playbackSession.bridgePlaySessionId), undefined);
+
+  const bridgeIdDelete = await app.inject({
+    method: "DELETE",
+    url: `/Items/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(bridgeIdDelete.statusCode, 204);
+  assert.equal(upstream.rawRequests[1].serverId, "main");
+  assert.equal(upstream.rawRequests[1].path, "/Items/main-alien");
+  assert.equal(upstream.rawRequests[1].init.method, "DELETE");
+  assert.equal(store.listIndexedItems().some((item) => item.serverId === "main" && item.itemId === "main-alien"), false);
+  assert.equal(store.listIndexedItems().some((item) => item.serverId === "remote" && item.itemId === "remote-alien"), true);
+
+  const unknownDelete = await app.inject({
+    method: "DELETE",
+    url: "/Items/not-indexed",
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(unknownDelete.statusCode, 404);
+  assert.equal(upstream.rawRequests.length, 2);
 
   await app.close();
   store.close();

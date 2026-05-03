@@ -12,7 +12,7 @@ import type { BrowseQuery } from "./library.js";
 import { logicalItemKey, type SourceItem } from "./merge.js";
 import { findMetadataItem, listAlbumArtists, listArtists, listGenres, listPersons, listStudios, listYears } from "./metadata.js";
 import { rewriteDto } from "./rewriter.js";
-import type { Store } from "./store.js";
+import type { IndexedItemRecord, Store } from "./store.js";
 import { UpstreamClient } from "./upstream.js";
 
 export interface AppDependencies {
@@ -485,6 +485,31 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     return itemDetail(request, reply, auth.user.name, requireSelf(auth, routeUserId), itemId);
+  });
+
+  app.delete("/Items/:itemId", async (request, reply) => {
+    requireSession(request, config, store);
+    if (!upstream.raw) {
+      unsupported(reply, "The configured upstream client does not support item deletion");
+      return;
+    }
+
+    const { itemId } = request.params as { itemId: string };
+    const source = deleteSourceForItem(itemId);
+    if (!source) {
+      notFound(reply, "Item not found");
+      return;
+    }
+
+    try {
+      await upstream.raw(source.serverId, `/Items/${source.itemId}`, { method: "DELETE" });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw badGatewayError(`Upstream item deletion failed: ${detail}`);
+    }
+
+    store.removeIndexedItem(source.serverId, source.itemId);
+    reply.code(204).send();
   });
 
   async function itemDetail(request: FastifyRequest, reply: FastifyReply, userName: string, userIdValue: string, itemId: string): Promise<Record<string, unknown> | void> {
@@ -1334,6 +1359,34 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return userDataDto(store, userIdValue, itemId);
   }
 
+  function deleteSourceForItem(itemIdValue: string): IndexedItemRecord | undefined {
+    const bridgeSources = bridgeItemSources(config, store, itemIdValue);
+    if (bridgeSources.length > 0) return bridgeSources[0];
+    return sortIndexedSourcesByPriority(store.findIndexedItemsBySourceId(itemIdValue))[0];
+  }
+
+  function sortIndexedSourcesByPriority(sources: IndexedItemRecord[]): IndexedItemRecord[] {
+    return [...sources].sort((left, right) => {
+      const priorityDelta = indexedSourcePriority(left) - indexedSourcePriority(right);
+      if (priorityDelta !== 0) return priorityDelta;
+      const sourceDelta = left.serverId.localeCompare(right.serverId) || left.libraryId.localeCompare(right.libraryId);
+      return sourceDelta || left.itemId.localeCompare(right.itemId);
+    });
+  }
+
+  function indexedSourcePriority(source: IndexedItemRecord): number {
+    let priority = 0;
+    for (const library of config.libraries) {
+      for (const configuredSource of library.sources) {
+        if (configuredSource.server === source.serverId && configuredSource.libraryId === source.libraryId) {
+          return priority;
+        }
+        priority += 1;
+      }
+    }
+    return Number.MAX_SAFE_INTEGER;
+  }
+
   async function proxyProgressiveStream(kind: "Videos" | "Audio", request: FastifyRequest, reply: FastifyReply): Promise<void> {
     requireSession(request, config, store);
     if (!upstream.raw) {
@@ -1708,7 +1761,6 @@ function registerUnsupportedRoutes(app: FastifyInstance): void {
     app.all(`/${prefix}/*`, async (_request, reply) => unsupported(reply, `${prefix} is not supported by Jellyfin Bridge`));
   }
 
-  app.delete("/Items/:itemId", async (_request, reply) => unsupported(reply, "Item deletion is not supported by Jellyfin Bridge"));
   app.post("/Items/:itemId/Refresh", async (_request, reply) => unsupported(reply, "Metadata refresh is not supported by Jellyfin Bridge"));
   app.post("/Items/:itemId", async (_request, reply) => unsupported(reply, "Metadata editing is not supported by Jellyfin Bridge"));
 }
