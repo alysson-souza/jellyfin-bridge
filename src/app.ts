@@ -813,7 +813,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     let sawResponse = false;
 
     await Promise.all(sources.map(async (source) => {
-      const query = await liveQueryForSource(client, cacheVersion, userName, rawQuery, source);
+      const query = aggregateLivePageQuery(rawQuery, await liveQueryForSource(client, cacheVersion, userName, rawQuery, source));
       try {
         logUpstreamJson(request, path, source, path);
         const response = await client.json<unknown>(source.serverId, path, { query });
@@ -950,6 +950,18 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const upstreamUserId = await liveUserId(client, cacheVersion, source.serverId, userName);
     if (upstreamUserId) {
       query.UserId = upstreamUserId;
+    }
+    return query;
+  }
+
+  function aggregateLivePageQuery(rawQuery: unknown, query: Record<string, string | number | boolean | undefined>): Record<string, string | number | boolean | undefined> {
+    const startIndex = startIndexFrom(rawQuery) ?? 0;
+    const limit = limitFrom(rawQuery);
+    delete query.startIndex;
+    query.StartIndex = 0;
+    if (limit !== undefined) {
+      delete query.limit;
+      query.Limit = startIndex + limit;
     }
     return query;
   }

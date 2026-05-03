@@ -2315,6 +2315,76 @@ test("serves latest media from online sources when another source is unavailable
   store.close();
 });
 
+test("pages live next-up after merging upstream results", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "primary", name: "Primary", url: "https://primary.example.com", token: "token" },
+      { id: "secondary", name: "Secondary", url: "https://secondary.example.com", token: "token" }
+    ],
+    libraries: []
+  };
+  const allItems = {
+    primary: Array.from({ length: 30 }, (_, index) => ({
+      Id: `primary-${index}`,
+      Type: "Episode",
+      Name: `Primary ${index}`,
+      ProviderIds: { Tvdb: `p-${index}` }
+    })),
+    secondary: Array.from({ length: 30 }, (_, index) => ({
+      Id: `secondary-${index}`,
+      Type: "Episode",
+      Name: `Secondary ${index}`,
+      ProviderIds: { Tvdb: `s-${index}` }
+    }))
+  };
+  const upstream = {
+    requests: [] as Array<{ serverId: string; path: string; init: any }>,
+    async json<T>(serverId: string, path: string, init: any): Promise<T> {
+      this.requests.push({ serverId, path, init });
+      if (path === "/Users") return [{ Id: `${serverId}-user`, Name: "alice" }] as T;
+      if (path !== "/Shows/NextUp") throw new Error(`Unexpected upstream request ${serverId}:${path}`);
+      const query = init.query as Record<string, string | number | undefined>;
+      const start = Number(query.StartIndex ?? query.startIndex ?? 0);
+      const limit = Number(query.Limit ?? query.limit ?? allItems[serverId as keyof typeof allItems].length);
+      const items = allItems[serverId as keyof typeof allItems].slice(start, start + limit);
+      return { Items: items, TotalRecordCount: allItems[serverId as keyof typeof allItems].length, StartIndex: start } as T;
+    }
+  };
+  const store = new Store(":memory:");
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const nextUp = await app.inject({
+    method: "GET",
+    url: `/Shows/NextUp?userId=${login.json().User.Id}&startIndex=50&limit=6`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(nextUp.statusCode, 200);
+  assert.equal(nextUp.json().Items.length, 6);
+  assert.equal(nextUp.json().TotalRecordCount, 60);
+  assert.deepEqual(nextUp.json().Items.map((item: any) => item.Name), [
+    "Secondary 20",
+    "Secondary 21",
+    "Secondary 22",
+    "Secondary 23",
+    "Secondary 24",
+    "Secondary 25"
+  ]);
+  assert.deepEqual(upstream.requests
+    .filter((request) => request.path === "/Shows/NextUp")
+    .map((request) => request.init.query), [
+    { StartIndex: 0, Limit: 56, UserId: "primary-user" },
+    { StartIndex: 0, Limit: 56, UserId: "secondary-user" }
+  ]);
+
+  await app.close();
+  store.close();
+});
+
 test("routes pass-through latest media to the selected upstream library", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
