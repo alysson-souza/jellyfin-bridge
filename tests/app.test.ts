@@ -2059,6 +2059,42 @@ test("returns bad gateway when upstream PlaybackInfo fails", async () => {
   store.close();
 });
 
+test("keeps the server alive when an upstream closes a proxied stream", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertMediaSourceMapping({
+    bridgeMediaSourceId: "bridge-source",
+    serverId: "main",
+    upstreamItemId: "main-alien",
+    upstreamMediaSourceId: "source-main"
+  });
+  const upstream = new FakeUpstream({});
+  upstream.rawResponses["main:/Videos/main-alien/stream"] = {
+    statusCode: 200,
+    headers: { "content-type": "video/x-matroska" },
+    body: upstreamSocketClosedStream()
+  };
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const stream = await app.inject({
+    method: "GET",
+    url: "/Videos/bridge-alien/stream?MediaSourceId=bridge-source&Static=true",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(stream.statusCode, 200);
+
+  await app.close();
+  store.close();
+});
+
 test("aggregates and proxies home, artwork, detail, and playback routes without indexed state", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
@@ -2318,4 +2354,18 @@ class FakeUpstream {
     if (!response) throw new Error(`Unexpected upstream raw request ${serverId}:${path}`);
     return response;
   }
+}
+
+function upstreamSocketClosedStream(): Readable {
+  let sent = false;
+  return new Readable({
+    read() {
+      if (sent) return;
+      sent = true;
+      this.push(Buffer.from("data"));
+      const error = new Error("other side closed") as Error & { code?: string };
+      error.code = "UND_ERR_SOCKET";
+      this.destroy(error);
+    }
+  });
 }

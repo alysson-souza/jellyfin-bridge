@@ -1,5 +1,4 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
-import { pipeline } from "node:stream/promises";
 import { authenticatePassword, parseAuthorization, requireSession, type AuthContext, userDto, userId } from "./auth.js";
 import type { BridgeConfig, BridgeUser, RuntimeConfigSource } from "./config.js";
 import { badGatewayError, notFound, unsupported } from "./errors.js";
@@ -1741,12 +1740,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       reply.hijack();
       reply.raw.statusCode = response.statusCode;
       copyProxyResponseHeaders({ header: (name, value) => reply.raw.setHeader(name, value) }, response.headers);
-      try {
-        await pipeline(response.body, reply.raw);
-      } catch (error) {
-        if (isClientAbort(error)) return;
-        throw error;
-      }
+      await forwardProxyBody(reply, response.body);
       return;
     }
 
@@ -1755,10 +1749,54 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     reply.send(response.body);
   }
 
-  function isClientAbort(error: unknown): boolean {
+  function isProxyStreamClose(error: unknown): boolean {
     if (!error || typeof error !== "object" || !("code" in error)) return false;
     const code = (error as { code?: unknown }).code;
-    return code === "ERR_STREAM_PREMATURE_CLOSE" || code === "ECONNRESET";
+    return code === "ERR_STREAM_PREMATURE_CLOSE" || code === "ECONNRESET" || code === "UND_ERR_SOCKET";
+  }
+
+  async function forwardProxyBody(reply: FastifyReply, body: AsyncIterable<unknown>): Promise<void> {
+    try {
+      for await (const chunk of body) {
+        if (reply.raw.destroyed || reply.raw.writableEnded) return;
+        if (!reply.raw.write(chunk as string | Uint8Array)) {
+          await waitForProxyDrain(reply);
+        }
+      }
+      if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+        reply.raw.end();
+      }
+    } catch (error) {
+      if (isProxyStreamClose(error)) {
+        if (!reply.raw.destroyed && !reply.raw.writableEnded) {
+          reply.raw.end();
+        }
+        return;
+      }
+      if (!reply.raw.destroyed) {
+        reply.raw.destroy(error instanceof Error ? error : new Error(String(error)));
+      }
+      throw error;
+    }
+  }
+
+  function waitForProxyDrain(reply: FastifyReply): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const onDrain = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        reject(error);
+      };
+      const cleanup = () => {
+        reply.raw.off("drain", onDrain);
+        reply.raw.off("error", onError);
+      };
+      reply.raw.once("drain", onDrain);
+      reply.raw.once("error", onError);
+    });
   }
 
   async function forwardPlaybackReport(path: string, body: unknown, userName: string): Promise<void> {
