@@ -1,0 +1,25 @@
+[Unit]
+Description=Jellyfin Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jellyfin-bridge
+Group=jellyfin-bridge
+WorkingDirectory=/opt/jellyfin-bridge
+Environment=NODE_ENV=production
+EnvironmentFile=-/etc/jellyfin-bridge.env
+ExecStart=/usr/bin/node /opt/jellyfin-bridge/dist/src/server.js --config /etc/jellyfin-bridge/config.yaml --database /var/lib/jellyfin-bridge/jellyfin-bridge.db --scan-on-start --scan-interval-minutes 60
+Restart=on-failure
+RestartSec=5
+StateDirectory=jellyfin-bridge
+ConfigurationDirectory=jellyfin-bridge
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jellyfin-bridge
+
+[Install]
+WantedBy=multi-user.target

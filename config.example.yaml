@@ -1,0 +1,58 @@
+# yaml-language-server: $schema=./config.schema.json
+
+# The bridge listens here. publicUrl is the URL your clients use.
+server:
+  bind: 0.0.0.0
+  port: 8096
+  publicUrl: http://localhost:8096
+  name: Jellyfin Bridge
+
+# Bridge users are local to the bridge. Generate an Argon2 hash for the
+# password your clients will type, then paste it into passwordHash.
+auth:
+  users:
+    - name: bridge-user
+      passwordHash: "$argon2id$replace-me"
+
+# Each upstream is a real Jellyfin server. Create API keys in Jellyfin and
+# put the token values in .env using the variable names referenced below.
+upstreams:
+  - id: main
+    name: Main
+    url: https://jellyfin-main.example.com
+    token: ${MAIN_JELLYFIN_TOKEN}
+  - id: secondary
+    name: Secondary
+    url: https://jellyfin-secondary.example.com
+    token: ${SECONDARY_JELLYFIN_TOKEN}
+
+# Optional startup behavior. Keep validation enabled unless upstreams are
+# reachable only in some runtime environments.
+startup:
+  validateUpstreams: true
+
+# Optional scan tuning. Scheduled and startup refreshes use Jellyfin's
+# MinDateLastSaved when a prior cursor exists, with a small overlap window.
+scan:
+  pageSize: 500
+  concurrency: 4
+  incrementalSafetySeconds: 60
+  onStart: false
+  intervalMinutes: 0
+  fullScanIntervalMinutes: 0
+
+# Optional. Define libraries when you want to merge matching upstream
+# libraries or choose the bridge library names. If this list is empty,
+# upstream libraries are exposed separately.
+#
+# Each source points at one upstream library. libraryId is the Jellyfin view Id
+# returned by /UserViews?UserId=... on that upstream server.
+libraries:
+  - id: movies
+    name: Movies
+    collectionType: movies
+    sources:
+      - server: main
+        libraryId: "11111111111111111111111111111111"
+      - server: secondary
+        libraryId: "22222222222222222222222222222222"

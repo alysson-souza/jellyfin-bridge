@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema",
+  "title": "Jellyfin Bridge configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["server", "auth", "upstreams"],
+  "properties": {
+    "server": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["bind", "port", "name"],
+      "properties": {
+        "bind": {
+          "type": "string",
+          "default": "0.0.0.0",
+          "description": "Address the bridge listens on inside the host or container."
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535,
+          "default": 8096,
+          "description": "Port the bridge listens on."
+        },
+        "publicUrl": {
+          "type": "string",
+          "format": "uri",
+          "description": "External URL clients use to reach the bridge, especially behind a reverse proxy."
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "default": "Jellyfin Bridge",
+          "description": "Server name shown to Jellyfin clients."
+        }
+      }
+    },
+    "auth": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["users"],
+      "properties": {
+        "users": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Users that can log into the bridge. Passwords are Argon2 hashes.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "passwordHash"],
+            "properties": {
+              "name": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Bridge username. Using the same username upstream helps user-specific routes."
+              },
+              "passwordHash": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^\\$argon2",
+                "description": "Argon2 password hash for the bridge login password."
+              }
+            }
+          }
+        }
+      }
+    },
+    "upstreams": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Real Jellyfin servers the bridge aggregates and proxies.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "url", "token"],
+        "properties": {
+          "id": {
+            "$ref": "#/definitions/localId",
+            "description": "Stable local identifier used by library source mappings."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Human-readable upstream name. Also used for pass-through library prefixes."
+          },
+          "url": {
+            "type": "string",
+            "format": "uri",
+            "description": "Base URL of the upstream Jellyfin server."
+          },
+          "token": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Jellyfin API key. Environment variable references such as ${MAIN_JELLYFIN_TOKEN} are supported."
+          }
+        }
+      }
+    },
+    "startup": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional startup behavior.",
+      "properties": {
+        "validateUpstreams": {
+          "type": "boolean",
+          "default": true,
+          "description": "Validate upstream reachability and configured library ids before the bridge starts listening."
+        }
+      }
+    },
+    "scan": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Optional catalog refresh tuning.",
+      "properties": {
+        "pageSize": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5000,
+          "default": 500,
+          "description": "Number of upstream items requested per scan page."
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 4,
+          "description": "Maximum number of upstream libraries scanned at the same time."
+        },
+        "incrementalSafetySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3600,
+          "default": 60,
+          "description": "Overlap window applied to incremental MinDateLastSaved refreshes to avoid missing changes during a previous scan."
+        },
+        "onStart": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run an incremental refresh in the background after startup."
+        },
+        "intervalMinutes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Run incremental refreshes at this interval. Set to 0 to disable."
+        },
+        "fullScanIntervalMinutes": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Run slower full reconciliation scans at this interval to remove deleted upstream items. Set to 0 to disable."
+        }
+      }
+    },
+    "libraries": {
+      "type": "array",
+      "default": [],
+      "description": "Optional bridge-visible libraries that merge one or more upstream libraries.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "collectionType", "sources"],
+        "properties": {
+          "id": {
+            "$ref": "#/definitions/localId",
+            "description": "Stable local bridge library identifier."
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Library name shown to clients."
+          },
+          "collectionType": {
+            "type": "string",
+            "minLength": 1,
+            "examples": ["movies", "tvshows", "music", "musicvideos", "homevideos"],
+            "description": "Jellyfin collection type for the merged bridge library."
+          },
+          "sources": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Upstream libraries to expose as this bridge library.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["server", "libraryId"],
+              "properties": {
+                "server": {
+                  "$ref": "#/definitions/localId",
+                  "description": "Upstream id from the upstreams list."
+                },
+                "libraryId": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Real Jellyfin library id from the upstream server."
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "localId": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9_-]+$"
+    }
+  }
+}

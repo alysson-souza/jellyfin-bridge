@@ -1,0 +1,18 @@
+services:
+  jellyfin-bridge:
+    build:
+      context: .
+    image: jellyfin-bridge:local
+    env_file:
+      - .env
+    environment:
+      JELLYFIN_BRIDGE_LOG_REQUESTS: "1"
+    ports:
+      - "8096:8096"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - jellyfin-bridge-data:/data
+    restart: unless-stopped
+
+volumes:
+  jellyfin-bridge-data:
