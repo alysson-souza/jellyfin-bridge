@@ -8,6 +8,7 @@
     "node": ">=22 <23"
   },
   "scripts": {
+    "audit:docker-image": "docker compose build jellyfin-bridge && sh scripts/audit-docker-image.sh jellyfin-bridge:local",
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/server.ts --config config.yaml",
     "start": "node dist/src/server.js --config config.yaml",

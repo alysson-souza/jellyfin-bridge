@@ -3,6 +3,11 @@ services:
     build:
       context: .
     image: jellyfin-bridge:local
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     env_file:
       - .env
     environment:
@@ -11,7 +16,7 @@ services:
       - "8096:8096"
     volumes:
       - ./config.yaml:/config/config.yaml:ro
-      - jellyfin-bridge-data:/data
+      - jellyfin-bridge-data:/data:rw
     restart: unless-stopped
 
 volumes:

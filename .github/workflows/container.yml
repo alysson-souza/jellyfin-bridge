@@ -27,6 +27,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -34,14 +37,6 @@ jobs:
         id: node-version
         shell: bash
         run: echo "version=$(cat .node-version)" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GitHub Container Registry
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract image metadata
         id: meta
@@ -55,15 +50,82 @@ jobs:
             type=sha,prefix=sha-
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
-      - name: Build and publish image
+      - name: Build linux/amd64 image for audit
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
-          tags: ${{ steps.meta.outputs.tags }}
+          platforms: linux/amd64
+          load: true
+          tags: jellyfin-bridge:audit-amd64
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             NODE_VERSION=${{ steps.node-version.outputs.version }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+      - name: Audit linux/amd64 image filesystem
+        run: sh scripts/audit-docker-image.sh jellyfin-bridge:audit-amd64
+
+      - name: Scan linux/amd64 image vulnerabilities
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --no-progress jellyfin-bridge:audit-amd64
+
+      - name: Build linux/arm64 image for audit
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          load: true
+          tags: jellyfin-bridge:audit-arm64
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            NODE_VERSION=${{ steps.node-version.outputs.version }}
+          cache-from: type=gha
+
+      - name: Audit linux/arm64 image filesystem
+        run: sh scripts/audit-docker-image.sh jellyfin-bridge:audit-arm64
+
+      - name: Scan linux/arm64 image vulnerabilities
+        run: docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:latest image --scanners vuln --severity HIGH,CRITICAL --exit-code 1 --no-progress jellyfin-bridge:audit-arm64
+
+      - name: Log in to GitHub Container Registry
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish audited platform images
+        if: startsWith(github.ref, 'refs/tags/v')
+        id: publish-platforms
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          image="${REGISTRY}/${IMAGE_NAME}"
+          amd64_ref="${image}:audit-${GITHUB_SHA}-amd64"
+          arm64_ref="${image}:audit-${GITHUB_SHA}-arm64"
+
+          docker tag jellyfin-bridge:audit-amd64 "$amd64_ref"
+          docker tag jellyfin-bridge:audit-arm64 "$arm64_ref"
+
+          amd64_digest="$(docker push "$amd64_ref" | awk '/digest:/ {print $3}' | tail -n 1)"
+          arm64_digest="$(docker push "$arm64_ref" | awk '/digest:/ {print $3}' | tail -n 1)"
+
+          echo "amd64_digest_ref=${image}@${amd64_digest}" >> "$GITHUB_OUTPUT"
+          echo "arm64_digest_ref=${image}@${arm64_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish audited multi-platform manifests
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            docker buildx imagetools create \
+              --tag "$tag" \
+              "${{ steps.publish-platforms.outputs.amd64_digest_ref }}" \
+              "${{ steps.publish-platforms.outputs.arm64_digest_ref }}"
+          done <<'EOF'
+          ${{ steps.meta.outputs.tags }}
+          EOF
