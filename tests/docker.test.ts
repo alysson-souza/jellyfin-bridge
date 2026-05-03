@@ -39,9 +39,21 @@ test("runtime image avoids shell-form startup hooks", async () => {
   const dockerfile = await readFile("Dockerfile", "utf8");
 
   assert.match(dockerfile, /ENTRYPOINT \["\/nodejs\/bin\/node"\]/);
-  assert.match(dockerfile, /HEALTHCHECK[^\n]+CMD \["\/nodejs\/bin\/node", "-e"/);
+  assert.match(dockerfile, /HEALTHCHECK[^\n]+CMD \["\/nodejs\/bin\/node", "dist\/src\/healthcheck\.js"\]/);
+  assert.doesNotMatch(dockerfile, /HEALTHCHECK[^\n]+fetch\(/);
+  assert.doesNotMatch(dockerfile, /HEALTHCHECK[^\n]+setTimeout\(/);
+  assert.doesNotMatch(dockerfile, /HEALTHCHECK[^\n]+"-e"/);
   assert.doesNotMatch(dockerfile, /HEALTHCHECK[^\n]+CMD node -e/);
   assert.match(dockerfile, /CMD \["dist\/src\/server\.js", "--config", "\/config\/config\.yaml", "--database", "\/data\/jellyfin-bridge\.db"\]/);
+});
+
+test("runtime healthcheck uses a small Node HTTP probe", async () => {
+  const healthcheck = await readFile("src/healthcheck.ts", "utf8");
+
+  assert.match(healthcheck, /node:http/);
+  assert.match(healthcheck, /\/System\/Ping/);
+  assert.match(healthcheck, /response\.statusCode === 200/);
+  assert.doesNotMatch(healthcheck, /fetch\(/);
 });
 
 test("docker build context excludes local secrets and generated state", async () => {

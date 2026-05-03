@@ -40,5 +40,5 @@ USER nonroot
 EXPOSE 8096
 VOLUME ["/data"]
 ENTRYPOINT ["/nodejs/bin/node"]
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/nodejs/bin/node", "-e", "fetch('http://127.0.0.1:8096/System/Ping').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["/nodejs/bin/node", "dist/src/healthcheck.js"]
 CMD ["dist/src/server.js", "--config", "/config/config.yaml", "--database", "/data/jellyfin-bridge.db"]
