@@ -764,6 +764,14 @@ test("deletes indexed items through the resolved upstream source", async () => {
     logicalKey: "movie:tmdb:1091",
     json: { Id: "remote-thing", Type: "Movie", Name: "The Thing", ProviderIds: { Tmdb: "1091" } }
   });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-empty-json-delete",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:tmdb:2222",
+    json: { Id: "remote-empty-json-delete", Type: "Movie", Name: "Empty JSON Delete", ProviderIds: { Tmdb: "2222" } }
+  });
   store.upsertMediaSourceMapping({
     bridgeMediaSourceId: "remote-thing-source",
     serverId: "remote",
@@ -779,6 +787,7 @@ test("deletes indexed items through the resolved upstream source", async () => {
 
   const upstream = new FakeUpstream({});
   upstream.rawResponses["remote:/Items/remote-thing"] = { statusCode: 204, headers: {}, body: "" };
+  upstream.rawResponses["remote:/Items/remote-empty-json-delete"] = { statusCode: 204, headers: {}, body: "" };
   upstream.rawResponses["main:/Items/main-alien"] = { statusCode: 204, headers: {}, body: "" };
   const app = buildApp({ config, store, upstream });
   const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
@@ -813,13 +822,23 @@ test("deletes indexed items through the resolved upstream source", async () => {
   assert.equal(store.listIndexedItems().some((item) => item.serverId === "main" && item.itemId === "main-alien"), false);
   assert.equal(store.listIndexedItems().some((item) => item.serverId === "remote" && item.itemId === "remote-alien"), true);
 
+  const emptyJsonBodyDelete = await app.inject({
+    method: "DELETE",
+    url: "/Items/remote-empty-json-delete",
+    headers: { "X-MediaBrowser-Token": token, "Content-Type": "application/json" }
+  });
+  assert.equal(emptyJsonBodyDelete.statusCode, 204, emptyJsonBodyDelete.body);
+  assert.equal(upstream.rawRequests[2].serverId, "remote");
+  assert.equal(upstream.rawRequests[2].path, "/Items/remote-empty-json-delete");
+  assert.equal(upstream.rawRequests[2].init.method, "DELETE");
+
   const unknownDelete = await app.inject({
     method: "DELETE",
     url: "/Items/not-indexed",
     headers: { "X-MediaBrowser-Token": token }
   });
   assert.equal(unknownDelete.statusCode, 404);
-  assert.equal(upstream.rawRequests.length, 2);
+  assert.equal(upstream.rawRequests.length, 3);
 
   await app.close();
   store.close();

@@ -81,6 +81,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     logger: process.env.JELLYFIN_BRIDGE_LOG_REQUESTS === "1",
     rewriteUrl: (request) => stripEmbyBasePath(request.url ?? "/")
   });
+  allowEmptyJsonDeleteBodies(app);
   let serverId = bridgeServerId(config.server.name);
   let configVersion = 0;
   const liveUserCache = new Map<string, { expiresAt: number; promise: Promise<string | undefined> }>();
@@ -1844,6 +1845,19 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       }
     }));
   }
+}
+
+function allowEmptyJsonDeleteBodies(app: FastifyInstance): void {
+  const defaultJsonParser = app.getDefaultJsonParser("error", "error");
+  app.removeContentTypeParser("application/json");
+  app.addContentTypeParser<string>("application/json", { parseAs: "string" }, (request, body, done) => {
+    if (request.method === "DELETE" && body.length === 0) {
+      done(null, undefined);
+      return;
+    }
+
+    defaultJsonParser(request, body, done);
+  });
 }
 
 function toRuntimeConfigSource(config: BridgeConfig | RuntimeConfigSource): RuntimeConfigSource {
