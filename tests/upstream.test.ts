@@ -65,6 +65,39 @@ test("does not retry non-transient upstream http failures", async () => {
   assert.equal(attempts, 1);
 });
 
+test("upstream clients do not expose mutable config replacement", () => {
+  const client = new UpstreamClient([{ id: "main", name: "Main", url: "https://example.com", token: "token" }]);
+
+  assert.equal("replaceUpstreams" in client, false);
+});
+
+test("new upstream client instances use updated configuration for future requests", async () => {
+  const seen: Array<{ url: string; token: unknown }> = [];
+  const options = {
+    request: async (url: URL, options: any) => {
+      const headers = options?.headers as Record<string, unknown> | undefined;
+      seen.push({ url: url.toString(), token: headers?.["X-Emby-Token"] });
+      return response(200, { ok: true });
+    }
+  };
+  const oldClient = new UpstreamClient(
+    [{ id: "main", name: "Main", url: "https://old.example.com", token: "old-token" }],
+    options
+  );
+  const newClient = new UpstreamClient(
+    [{ id: "main", name: "Main", url: "https://new.example.com/jellyfin", token: "new-token" }],
+    options
+  );
+
+  await oldClient.json("main", "/System/Ping");
+  await newClient.json("main", "/System/Ping");
+
+  assert.deepEqual(seen, [
+    { url: "https://old.example.com/System/Ping", token: "old-token" },
+    { url: "https://new.example.com/jellyfin/System/Ping", token: "new-token" }
+  ]);
+});
+
 function response(statusCode: number, body: unknown) {
   return {
     statusCode,

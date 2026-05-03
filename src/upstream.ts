@@ -19,15 +19,13 @@ export interface UpstreamClientOptions {
 }
 
 export class UpstreamClient {
-  private readonly upstreams = new Map<string, UpstreamConfig>();
+  private readonly upstreams: Map<string, UpstreamConfig>;
   private readonly request: RequestFunction;
   private readonly retries: number;
   private readonly timeoutMs: number;
 
   constructor(upstreams: UpstreamConfig[], options: UpstreamClientOptions = {}) {
-    for (const upstream of upstreams) {
-      this.upstreams.set(upstream.id, upstream);
-    }
+    this.upstreams = new Map(upstreams.map((upstream) => [upstream.id, upstream]));
     this.request = options.request ?? ((url, options) => request(url, options));
     this.retries = options.retries ?? 2;
     this.timeoutMs = options.timeoutMs ?? 30_000;

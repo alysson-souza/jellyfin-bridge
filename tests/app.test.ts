@@ -3,9 +3,9 @@ import assert from "node:assert/strict";
 import { Readable } from "node:stream";
 import { hash } from "@node-rs/argon2";
 import { buildApp } from "../src/app.js";
-import type { BridgeConfig } from "../src/config.js";
+import type { BridgeConfig, RuntimeConfigSource } from "../src/config.js";
 import { Store } from "../src/store.js";
-import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId } from "../src/ids.js";
+import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId } from "../src/ids.js";
 import { passThroughLibraryId } from "../src/ids.js";
 
 test("supports Jellyfin login, authenticated system routes, user views, user data, and logout", async () => {
@@ -157,6 +157,450 @@ test("supports Jellyfin login, authenticated system routes, user views, user dat
   store.close();
 });
 
+test("uses updated runtime config after startup", async () => {
+  const oldPasswordHash = await hash("old-secret");
+  const newPasswordHash = await hash("new-secret");
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://old.test", name: "Old Bridge" },
+    auth: { users: [{ name: "alice", passwordHash: oldPasswordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://jellyfin.example.com", token: "token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "abc" }] }]
+  });
+  const store = new Store(":memory:");
+  const app = buildApp({ config: runtimeConfig, store });
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://new.test", name: "New Bridge" },
+    auth: { users: [{ name: "bob", passwordHash: newPasswordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://jellyfin.example.com", token: "token" }],
+    libraries: [{ id: "series", name: "Series", collectionType: "tvshows", sources: [{ server: "main", libraryId: "def" }] }]
+  });
+
+  const publicInfo = await app.inject({ method: "GET", url: "/System/Info/Public" });
+  assert.equal(publicInfo.json().ServerName, "New Bridge");
+  assert.equal(publicInfo.json().LocalAddress, "http://new.test");
+
+  const oldLogin = await app.inject({
+    method: "POST",
+    url: "/Users/AuthenticateByName",
+    payload: { Username: "alice", Pw: "old-secret" }
+  });
+  assert.equal(oldLogin.statusCode, 401);
+
+  const newLogin = await app.inject({
+    method: "POST",
+    url: "/Users/AuthenticateByName",
+    payload: { Username: "bob", Pw: "new-secret" }
+  });
+  assert.equal(newLogin.statusCode, 200);
+  const token = newLogin.json().AccessToken;
+
+  const views = await app.inject({ method: "GET", url: "/UserViews", headers: { "X-MediaBrowser-Token": token } });
+  assert.deepEqual(views.json().Items.map((item: Record<string, unknown>) => item.Name), ["Series"]);
+
+  await app.close();
+  store.close();
+});
+
+test("keeps login response on the pre-reload config across password verification", async () => {
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://old.test", name: "Old Bridge" },
+    auth: { users: [{ name: "alice", passwordHash: "old-hash" }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://jellyfin.example.com", token: "token" }],
+    libraries: []
+  });
+  const store = new Store(":memory:");
+  let releaseVerification!: () => void;
+  let verificationStarted!: () => void;
+  const releaseVerificationPromise = new Promise<void>((resolve) => {
+    releaseVerification = resolve;
+  });
+  const verificationStartedPromise = new Promise<void>((resolve) => {
+    verificationStarted = resolve;
+  });
+  const app = buildApp({
+    config: runtimeConfig,
+    store,
+    verifyPassword: async () => {
+      verificationStarted();
+      await releaseVerificationPromise;
+      return true;
+    }
+  });
+
+  const loginPromise = app.inject({
+    method: "POST",
+    url: "/Users/AuthenticateByName",
+    payload: { Username: "alice", Pw: "secret" }
+  });
+  await verificationStartedPromise;
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://new.test", name: "New Bridge" },
+    auth: { users: [{ name: "bob", passwordHash: "new-hash" }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://jellyfin.example.com", token: "token" }],
+    libraries: []
+  });
+  releaseVerification();
+
+  const login = await loginPromise;
+
+  assert.equal(login.statusCode, 200, login.body);
+  assert.equal(login.json().User.Name, "alice");
+  assert.equal(login.json().User.ServerId, bridgeServerId("Old Bridge"));
+  assert.equal(login.json().SessionInfo.ServerName, "Old Bridge");
+  assert.equal(login.json().ServerId, bridgeServerId("Old Bridge"));
+
+  await app.close();
+  store.close();
+});
+
+test("keeps in-flight live latest requests on the pre-reload upstream client", async () => {
+  const passwordHash = await hash("secret");
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "old-token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "main-movies" }] }]
+  });
+  const store = new Store(":memory:");
+  let releaseUsers!: () => void;
+  let usersStarted!: () => void;
+  const releaseUsersPromise = new Promise<void>((resolve) => {
+    releaseUsers = resolve;
+  });
+  const usersStartedPromise = new Promise<void>((resolve) => {
+    usersStarted = resolve;
+  });
+  const clients: ReloadingLiveUpstream[] = [];
+  const app = buildApp({
+    config: runtimeConfig,
+    store,
+    upstreamFactory: (upstreams) => {
+      const upstreamIds = new Set(upstreams.map((upstream) => upstream.id));
+      const client = new ReloadingLiveUpstream(upstreamIds, upstreamIds.has("main")
+        ? async () => {
+          usersStarted();
+          await releaseUsersPromise;
+        }
+        : undefined);
+      clients.push(client);
+      return client;
+    }
+  });
+
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const latestPromise = app.inject({
+    method: "GET",
+    url: `/Items/Latest?ParentId=${bridgeLibraryId("movies")}&Limit=1`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  await usersStartedPromise;
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "remote", name: "Remote", url: "https://remote.example.com", token: "new-token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "remote", libraryId: "remote-movies" }] }]
+  });
+  releaseUsers();
+
+  const latest = await latestPromise;
+
+  assert.equal(latest.statusCode, 200, latest.body);
+  assert.deepEqual(latest.json().map((item: Record<string, unknown>) => item.Name), ["Old Main Latest"]);
+  assert.deepEqual(clients[0].requests.map((request) => `${request.serverId}:${request.path}`), ["main:/Users", "main:/Items/Latest"]);
+  assert.equal(clients[1].requests.length, 0);
+
+  await app.close();
+  store.close();
+});
+
+test("keeps live latest fallback responses on the pre-reload config after a reload", async () => {
+  const passwordHash = await hash("secret");
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "old-token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "main-movies" }] }]
+  });
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-cached",
+    libraryId: "main-movies",
+    itemType: "Movie",
+    logicalKey: "movie:main-cached",
+    json: {
+      Id: "main-cached",
+      Type: "Movie",
+      Name: "Cached Old Main",
+      DateCreated: "2026-05-03T00:00:00.000Z",
+      ProviderIds: {}
+    }
+  });
+  let releaseUsers!: () => void;
+  let usersStarted!: () => void;
+  const releaseUsersPromise = new Promise<void>((resolve) => {
+    releaseUsers = resolve;
+  });
+  const usersStartedPromise = new Promise<void>((resolve) => {
+    usersStarted = resolve;
+  });
+  const clients: ReloadingLiveUpstream[] = [];
+  const app = buildApp({
+    config: runtimeConfig,
+    store,
+    upstreamFactory: (upstreams) => {
+      const upstreamIds = new Set(upstreams.map((upstream) => upstream.id));
+      const client = new ReloadingLiveUpstream(upstreamIds, upstreamIds.has("main")
+        ? async () => {
+          usersStarted();
+          await releaseUsersPromise;
+        }
+        : undefined, undefined, undefined, new Error("Upstream main request failed for /Items/Latest: offline"));
+      clients.push(client);
+      return client;
+    }
+  });
+
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const latestPromise = app.inject({
+    method: "GET",
+    url: "/Items/Latest?Limit=1",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  await usersStartedPromise;
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Reloaded Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "remote", name: "Remote", url: "https://remote.example.com", token: "new-token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "remote", libraryId: "remote-movies" }] }]
+  });
+  releaseUsers();
+
+  const latest = await latestPromise;
+
+  assert.equal(latest.statusCode, 200, latest.body);
+  assert.deepEqual(latest.json().map((item: Record<string, unknown>) => item.Name), ["Cached Old Main"]);
+  assert.equal(latest.json()[0].ServerId, bridgeServerId("Bridge"));
+  assert.deepEqual(clients[0].requests.map((request) => `${request.serverId}:${request.path}`), ["main:/Users", "main:/Items/Latest"]);
+  assert.equal(clients[1].requests.length, 0);
+
+  await app.close();
+  store.close();
+});
+
+test("keeps live next-up fallback responses on the pre-reload config after a reload", async () => {
+  const passwordHash = await hash("secret");
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "old-token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "main-shows" }] }]
+  });
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-episode",
+    libraryId: "main-shows",
+    itemType: "Episode",
+    logicalKey: "episode:main-episode",
+    json: {
+      Id: "main-episode",
+      Type: "Episode",
+      Name: "Cached Old NextUp",
+      SeriesId: "main-series",
+      SeasonId: "main-season",
+      ProviderIds: {}
+    }
+  });
+  let releaseUsers!: () => void;
+  let usersStarted!: () => void;
+  const releaseUsersPromise = new Promise<void>((resolve) => {
+    releaseUsers = resolve;
+  });
+  const usersStartedPromise = new Promise<void>((resolve) => {
+    usersStarted = resolve;
+  });
+  const clients: ReloadingLiveUpstream[] = [];
+  const app = buildApp({
+    config: runtimeConfig,
+    store,
+    upstreamFactory: (upstreams) => {
+      const upstreamIds = new Set(upstreams.map((upstream) => upstream.id));
+      const client = new ReloadingLiveUpstream(upstreamIds, upstreamIds.has("main")
+        ? async () => {
+          usersStarted();
+          await releaseUsersPromise;
+        }
+        : undefined, undefined, undefined, undefined, new Error("Upstream main request failed for /Shows/NextUp: offline"));
+      clients.push(client);
+      return client;
+    }
+  });
+
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const nextUpPromise = app.inject({
+    method: "GET",
+    url: "/Shows/NextUp",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  await usersStartedPromise;
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Reloaded Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "remote", name: "Remote", url: "https://remote.example.com", token: "new-token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "remote", libraryId: "remote-shows" }] }]
+  });
+  releaseUsers();
+
+  const nextUp = await nextUpPromise;
+
+  assert.equal(nextUp.statusCode, 200, nextUp.body);
+  assert.deepEqual(nextUp.json().Items.map((item: Record<string, unknown>) => item.Name), ["Cached Old NextUp"]);
+  assert.equal(nextUp.json().Items[0].ServerId, bridgeServerId("Bridge"));
+  assert.deepEqual(clients[0].requests.map((request) => `${request.serverId}:${request.path}`), ["main:/Users", "main:/Shows/NextUp"]);
+  assert.equal(clients[1].requests.length, 0);
+
+  await app.close();
+  store.close();
+});
+
+test("keeps in-flight live browse responses on the pre-reload config and upstream client", async () => {
+  const passwordHash = await hash("secret");
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "old-token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "main-movies" }] }]
+  });
+  const store = new Store(":memory:");
+  let releaseItems!: () => void;
+  let itemsStarted!: () => void;
+  const releaseItemsPromise = new Promise<void>((resolve) => {
+    releaseItems = resolve;
+  });
+  const itemsStartedPromise = new Promise<void>((resolve) => {
+    itemsStarted = resolve;
+  });
+  const clients: ReloadingLiveUpstream[] = [];
+  const app = buildApp({
+    config: runtimeConfig,
+    store,
+    upstreamFactory: (upstreams) => {
+      const upstreamIds = new Set(upstreams.map((upstream) => upstream.id));
+      const client = new ReloadingLiveUpstream(upstreamIds, undefined, upstreamIds.has("main")
+        ? async () => {
+          itemsStarted();
+          await releaseItemsPromise;
+        }
+        : undefined);
+      clients.push(client);
+      return client;
+    }
+  });
+
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const browsePromise = app.inject({
+    method: "GET",
+    url: `/Items?ParentId=${bridgeLibraryId("movies")}&Limit=10`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  await itemsStartedPromise;
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "remote", name: "Remote", url: "https://remote.example.com", token: "new-token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "remote", libraryId: "remote-movies" }] }]
+  });
+  releaseItems();
+
+  const browse = await browsePromise;
+
+  assert.equal(browse.statusCode, 200, browse.body);
+  assert.deepEqual(browse.json().Items.map((item: Record<string, unknown>) => item.Name), ["Old Main Browse"]);
+  assert.deepEqual(clients[0].requests.map((request) => `${request.serverId}:${request.path}`), ["main:/Items"]);
+  assert.equal(clients[1].requests.length, 0);
+
+  await app.close();
+  store.close();
+});
+
+test("keeps in-flight live season refresh responses on the pre-reload config and upstream client", async () => {
+  const passwordHash = await hash("secret");
+  const runtimeConfig = new MutableRuntimeConfig({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "old-token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "main-shows" }] }]
+  });
+  const store = new Store(":memory:");
+  const seriesBridgeId = bridgeItemId("series:main-series");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-series",
+    libraryId: "main-shows",
+    itemType: "Series",
+    logicalKey: "series:main-series",
+    json: { Id: "main-series", Type: "Series", Name: "Old Main Series", ProviderIds: {} }
+  });
+  let releaseSeasons!: () => void;
+  let seasonsStarted!: () => void;
+  const releaseSeasonsPromise = new Promise<void>((resolve) => {
+    releaseSeasons = resolve;
+  });
+  const seasonsStartedPromise = new Promise<void>((resolve) => {
+    seasonsStarted = resolve;
+  });
+  const clients: ReloadingLiveUpstream[] = [];
+  const app = buildApp({
+    config: runtimeConfig,
+    store,
+    upstreamFactory: (upstreams) => {
+      const upstreamIds = new Set(upstreams.map((upstream) => upstream.id));
+      const client = new ReloadingLiveUpstream(upstreamIds, undefined, undefined, upstreamIds.has("main")
+        ? async () => {
+          seasonsStarted();
+          await releaseSeasonsPromise;
+        }
+        : undefined);
+      clients.push(client);
+      return client;
+    }
+  });
+
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const seasonsPromise = app.inject({
+    method: "GET",
+    url: `/Shows/${seriesBridgeId}/Seasons`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  await seasonsStartedPromise;
+
+  runtimeConfig.update({
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Reloaded Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "remote", name: "Remote", url: "https://remote.example.com", token: "new-token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "remote", libraryId: "remote-shows" }] }]
+  });
+  releaseSeasons();
+
+  const seasons = await seasonsPromise;
+
+  assert.equal(seasons.statusCode, 200, seasons.body);
+  assert.deepEqual(seasons.json().Items.map((item: Record<string, unknown>) => item.Name), ["Old Main Season"]);
+  assert.equal(seasons.json().Items[0].ServerId, bridgeServerId("Bridge"));
+  assert.deepEqual(clients[0].requests.map((request) => `${request.serverId}:${request.path}`), ["main:/Shows/main-series/Seasons"]);
+  assert.equal(clients[1].requests.length, 0);
+
+  await app.close();
+  store.close();
+});
+
 test("returns explicit unsupported response instead of upstream passthrough", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
@@ -188,6 +632,101 @@ test("returns explicit unsupported response instead of upstream passthrough", as
   await app.close();
   store.close();
 });
+
+class MutableRuntimeConfig implements RuntimeConfigSource {
+  private listeners = new Set<(config: BridgeConfig) => void>();
+
+  constructor(private config: BridgeConfig) {}
+
+  current(): BridgeConfig {
+    return this.config;
+  }
+
+  subscribe(listener: (config: BridgeConfig) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  update(config: BridgeConfig): void {
+    this.config = config;
+    for (const listener of this.listeners) {
+      listener(config);
+    }
+  }
+}
+
+class ReloadingLiveUpstream {
+  readonly requests: Array<{ serverId: string; path: string; init: unknown }> = [];
+
+  constructor(
+    private readonly upstreamIds: Set<string>,
+    private readonly beforeUsersResponse?: () => Promise<void>,
+    private readonly beforeItemsResponse?: () => Promise<void>,
+    private readonly beforeSeasonsResponse?: () => Promise<void>,
+    private readonly latestError?: Error,
+    private readonly nextUpError?: Error
+  ) {}
+
+  async json<T>(serverId: string, path: string, init: unknown): Promise<T> {
+    if (!this.upstreamIds.has(serverId)) {
+      throw new Error(`Unknown upstream ${serverId}`);
+    }
+    this.requests.push({ serverId, path, init });
+    if (path === "/Users") {
+      await this.beforeUsersResponse?.();
+      return [{ Id: `${serverId}-user`, Name: "alice" }] as unknown as T;
+    }
+    if (path === "/Items/Latest") {
+      if (this.latestError) throw this.latestError;
+      return [
+        {
+          Id: `${serverId}-latest`,
+          Type: "Movie",
+          Name: "Old Main Latest",
+          DateCreated: "2026-05-03T00:00:00.000Z",
+          ProviderIds: {}
+        }
+      ] as unknown as T;
+    }
+    if (path === "/Items") {
+      await this.beforeItemsResponse?.();
+      return {
+        Items: [
+          {
+            Id: `${serverId}-browse`,
+            Type: "Movie",
+            Name: "Old Main Browse",
+            ProviderIds: {}
+          }
+        ],
+        TotalRecordCount: 1,
+        StartIndex: 0
+      } as unknown as T;
+    }
+    if (path.endsWith("/Seasons")) {
+      await this.beforeSeasonsResponse?.();
+      return {
+        Items: [
+          {
+            Id: `${serverId}-season-1`,
+            Type: "Season",
+            Name: "Old Main Season",
+            SeriesId: "main-series",
+            IndexNumber: 1,
+            ProviderIds: {}
+          }
+        ],
+        TotalRecordCount: 1,
+        StartIndex: 0
+      } as unknown as T;
+    }
+    if (path === "/Shows/NextUp") {
+      if (this.nextUpError) throw this.nextUpError;
+      return { Items: [], TotalRecordCount: 0, StartIndex: 0 } as unknown as T;
+    }
+    throw new Error(`Unexpected upstream request ${serverId}:${path}`);
+  }
+}
 
 test("deletes indexed items through the resolved upstream source", async () => {
   const passwordHash = await hash("secret");

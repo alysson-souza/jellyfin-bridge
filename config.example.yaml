@@ -1,6 +1,7 @@
 # yaml-language-server: $schema=https://raw.githubusercontent.com/alysson-souza/jellyfin-bridge/main/config.schema.json
 
-# The bridge listens here. publicUrl is the URL your clients use.
+# The bridge listens here. publicUrl and name hot-reload; bind and port require
+# a restart because the listening socket is created at startup.
 server:
   bind: 0.0.0.0
   port: 8096

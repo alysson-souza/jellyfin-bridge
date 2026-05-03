@@ -70,6 +70,8 @@ curl http://localhost:8096/System/Ping
 
 Edit `config.yaml`. The comments in `config.example.yaml` explain each section, and the schema line at the top gives editor validation.
 
+The bridge watches `config.yaml` and hot-reloads valid changes after startup. Auth users, upstream URLs and tokens, library mappings, server display fields, and scan tuning apply to new requests without restarting. If a reload has invalid YAML, fails schema validation, or fails upstream validation, the bridge keeps serving with the last valid configuration and logs the reload failure. Changes to `server.bind` or `server.port` require a process restart because the listening socket is startup-only.
+
 By default the bridge validates upstream reachability and mapped library IDs before it starts listening. For local testing in an environment where an upstream DNS name or VPN route is temporarily unavailable, set `startup.validateUpstreams: false`; request-time upstream failures are still returned normally.
 
 To find Jellyfin library IDs, first get a user ID:
@@ -99,6 +101,7 @@ curl -X POST -H "X-Emby-Token: $BRIDGE_TOKEN" http://localhost:8096/Bridge/Scan
 For automatic refreshes, set `scan.onStart` or `scan.intervalMinutes` in `config.yaml`.
 Incremental refreshes use Jellyfin's `MinDateLastSaved` support after the first successful scan. Set
 `scan.fullScanIntervalMinutes` when you also want periodic full reconciliation to remove deleted upstream items.
+When hot-reloading library mappings, run `/Bridge/Scan` or wait for the next scheduled refresh before expecting newly mapped cached catalog contents to be fully populated.
 
 ## Client Setup
 

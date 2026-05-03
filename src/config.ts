@@ -1,4 +1,6 @@
+import { statSync, watch, watchFile, unwatchFile, type Stats } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { basename, dirname } from "node:path";
 import YAML from "yaml";
 import { z } from "zod";
 
@@ -58,9 +60,187 @@ export type BridgeUser = BridgeConfig["auth"]["users"][number];
 export type UpstreamConfig = BridgeConfig["upstreams"][number];
 export type LibraryConfig = BridgeConfig["libraries"][number];
 
+export interface RuntimeConfigSource {
+  current(): BridgeConfig;
+  subscribe(listener: (config: BridgeConfig) => void): () => void;
+}
+
+export interface ConfigWatcher {
+  stop(): void;
+}
+
+export interface RuntimeConfigOptions {
+  validateInitial?: (config: BridgeConfig) => Promise<void>;
+  validate?: (config: BridgeConfig) => Promise<void>;
+  logger?: {
+    info?(details: unknown, message?: string): void;
+    warn?(details: unknown, message?: string): void;
+    error?(details: unknown, message?: string): void;
+  };
+}
+
+export interface RuntimeConfigWatchOptions {
+  debounceMs?: number;
+}
+
+export interface RuntimeConfigReloadSource {
+  subscribe(listener: (config: BridgeConfig) => void): () => void;
+  watch(options?: RuntimeConfigWatchOptions): ConfigWatcher;
+}
+
+export function startRuntimeConfigReload(
+  runtimeConfig: RuntimeConfigReloadSource,
+  listener: (config: BridgeConfig) => void,
+  options?: RuntimeConfigWatchOptions
+): ConfigWatcher {
+  const unsubscribe = runtimeConfig.subscribe(listener);
+  let watcher: ConfigWatcher;
+  try {
+    watcher = runtimeConfig.watch(options);
+  } catch (error) {
+    unsubscribe();
+    throw error;
+  }
+  return {
+    stop() {
+      watcher.stop();
+      unsubscribe();
+    }
+  };
+}
+
+export function isRuntimeConfigWatchEvent(watchedFile: string, filename: string | Buffer | null | undefined): boolean {
+  const changedFile = filename?.toString();
+  return !changedFile || changedFile === watchedFile;
+}
+
 export async function loadConfig(path: string): Promise<BridgeConfig> {
   const raw = await readFile(path, "utf8");
   return parseConfig(raw, process.env);
+}
+
+export class RuntimeConfig implements RuntimeConfigSource {
+  private listeners = new Set<(config: BridgeConfig) => void>();
+  private reloadChain: Promise<boolean> = Promise.resolve(true);
+
+  private constructor(
+    private readonly path: string,
+    private readonly env: NodeJS.ProcessEnv,
+    private config: BridgeConfig,
+    private readonly options: RuntimeConfigOptions = {}
+  ) {}
+
+  static async load(path: string, env: NodeJS.ProcessEnv = process.env, options: RuntimeConfigOptions = {}): Promise<RuntimeConfig> {
+    const config = await loadConfigFrom(path, env);
+    if (options.validateInitial) {
+      await options.validateInitial(config);
+    } else if (options.validate) {
+      await options.validate(config);
+    }
+    return new RuntimeConfig(path, env, config, options);
+  }
+
+  current(): BridgeConfig {
+    return this.config;
+  }
+
+  subscribe(listener: (config: BridgeConfig) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
+  async reload(): Promise<boolean> {
+    this.reloadChain = this.reloadChain.then(() => this.reloadOnce(), () => this.reloadOnce());
+    return this.reloadChain;
+  }
+
+  watch(options: RuntimeConfigWatchOptions = {}): ConfigWatcher {
+    const debounceMs = options.debounceMs ?? 250;
+    const watchedPath = this.path;
+    const watchedDirectory = dirname(this.path);
+    const watchedFile = basename(this.path);
+    const initialStat = statSync(watchedPath);
+    let polledMtimeMs = initialStat.mtimeMs;
+    let polledSize = initialStat.size;
+    let timer: NodeJS.Timeout | undefined;
+    let polling = false;
+    let stopped = false;
+    const scheduleReload = (): void => {
+      if (stopped) return;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        timer = undefined;
+        void this.reload();
+      }, debounceMs);
+      timer.unref?.();
+    };
+    const startPolling = (): void => {
+      if (polling || stopped) return;
+      polling = true;
+      watchFile(watchedPath, { interval: Math.max(debounceMs, 50), persistent: false }, pollFile);
+    };
+    const pollFile = (current: Stats): void => {
+      if (current.mtimeMs !== polledMtimeMs || current.size !== polledSize) {
+        polledMtimeMs = current.mtimeMs;
+        polledSize = current.size;
+        scheduleReload();
+      }
+    };
+    startPolling();
+    let watcher: ReturnType<typeof watch> | undefined;
+    try {
+      watcher = watch(watchedDirectory, (_eventType, filename) => {
+        if (isRuntimeConfigWatchEvent(watchedFile, filename)) {
+          scheduleReload();
+        }
+      });
+      watcher.on("error", (error) => {
+        this.options.logger?.error?.({ error }, "Config watcher failed; polling remains active");
+        watcher?.close();
+      });
+    } catch (error) {
+      this.options.logger?.error?.({ error }, "Config watcher failed to start; polling remains active");
+    }
+
+    return {
+      stop() {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+        watcher?.close();
+        if (polling) unwatchFile(watchedPath, pollFile);
+      }
+    };
+  }
+
+  private async reloadOnce(): Promise<boolean> {
+    try {
+      const next = await loadConfigFrom(this.path, this.env);
+      if (this.options.validate) {
+        await this.options.validate(next);
+      }
+      if (sameConfig(this.config, next)) {
+        return true;
+      }
+      this.config = next;
+      for (const listener of this.listeners) {
+        listener(next);
+      }
+      this.options.logger?.info?.({ path: this.path }, "Configuration reloaded");
+      return true;
+    } catch (error) {
+      this.options.logger?.error?.({ error, path: this.path }, "Configuration reload failed; keeping previous configuration");
+      return false;
+    }
+  }
+}
+
+function sameConfig(left: BridgeConfig, right: BridgeConfig): boolean {
+  return JSON.stringify(left) === JSON.stringify(right);
+}
+
+async function loadConfigFrom(path: string, env: NodeJS.ProcessEnv): Promise<BridgeConfig> {
+  const raw = await readFile(path, "utf8");
+  return parseConfig(raw, env);
 }
 
 export function parseConfig(raw: string, env: NodeJS.ProcessEnv): BridgeConfig {

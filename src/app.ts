@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify";
 import { pipeline } from "node:stream/promises";
 import { authenticatePassword, parseAuthorization, requireSession, type AuthContext, userDto, userId } from "./auth.js";
-import type { BridgeConfig } from "./config.js";
+import type { BridgeConfig, BridgeUser, RuntimeConfigSource } from "./config.js";
 import { badGatewayError, notFound, unsupported } from "./errors.js";
 import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId, passThroughLibraryId } from "./ids.js";
 import { rewriteHlsPlaylist } from "./hls.js";
@@ -15,13 +15,17 @@ import { rewriteDto } from "./rewriter.js";
 import type { IndexedItemRecord, Store } from "./store.js";
 import { UpstreamClient } from "./upstream.js";
 
+interface AppUpstreamClient {
+  json<T>(serverId: string, path: string, init?: unknown): Promise<T>;
+  raw?(serverId: string, path: string, init?: unknown): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: unknown }>;
+}
+
 export interface AppDependencies {
-  config: BridgeConfig;
+  config: BridgeConfig | RuntimeConfigSource;
   store: Store;
-  upstream?: {
-    json<T>(serverId: string, path: string, init?: unknown): Promise<T>;
-    raw?(serverId: string, path: string, init?: unknown): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: unknown }>;
-  };
+  upstream?: AppUpstreamClient;
+  upstreamFactory?: (upstreams: BridgeConfig["upstreams"]) => AppUpstreamClient;
+  verifyPassword?: (user: BridgeUser, password: string) => Promise<boolean>;
 }
 
 interface LiveSource {
@@ -67,16 +71,34 @@ const LIVE_BROWSE_FIELDS = [
 ].join(",");
 
 export function buildApp(dependencies: AppDependencies): FastifyInstance {
-  const { config, store } = dependencies;
-  const upstream = dependencies.upstream ?? new UpstreamClient(config.upstreams);
-  const liveRouteAggregation = dependencies.upstream !== undefined;
+  const configSource = toRuntimeConfigSource(dependencies.config);
+  let config = configSource.current();
+  const { store } = dependencies;
+  const verifyPassword = dependencies.verifyPassword ?? authenticatePassword;
+  const createUpstream = dependencies.upstreamFactory ?? ((upstreams: BridgeConfig["upstreams"]) => new UpstreamClient(upstreams));
+  let upstream = dependencies.upstream ?? createUpstream(config.upstreams);
+  const liveRouteAggregation = dependencies.upstream !== undefined || dependencies.upstreamFactory !== undefined;
   const app = Fastify({
     logger: process.env.JELLYFIN_BRIDGE_LOG_REQUESTS === "1",
     rewriteUrl: (request) => stripEmbyBasePath(request.url ?? "/")
   });
-  const serverId = bridgeServerId(config.server.name);
+  let serverId = bridgeServerId(config.server.name);
+  let configVersion = 0;
   const liveUserCache = new Map<string, { expiresAt: number; promise: Promise<string | undefined> }>();
   const liveUserCacheTtlMs = 5 * 60_000;
+  const unsubscribeConfig = configSource.subscribe((nextConfig) => {
+    config = nextConfig;
+    configVersion += 1;
+    serverId = bridgeServerId(nextConfig.server.name);
+    if (!dependencies.upstream) {
+      upstream = createUpstream(nextConfig.upstreams);
+    }
+    liveUserCache.clear();
+  });
+
+  app.addHook("onClose", async () => {
+    unsubscribeConfig();
+  });
 
   app.setErrorHandler((error: unknown, _request, reply) => {
     const normalized = error instanceof Error ? error : new Error("Unknown error");
@@ -128,11 +150,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   });
 
   app.post("/Users/AuthenticateByName", async (request, reply) => {
+    const snapshotConfig = config;
+    const snapshotServerId = serverId;
     const body = request.body as { Username?: string; username?: string; Pw?: string; pw?: string; Password?: string; password?: string } | undefined;
     const username = body?.Username ?? body?.username;
     const password = body?.Pw ?? body?.pw ?? body?.Password ?? body?.password ?? "";
-    const user = config.auth.users.find((candidate) => candidate.name.toLowerCase() === username?.toLowerCase());
-    if (!user || !(await authenticatePassword(user, password))) {
+    const user = snapshotConfig.auth.users.find((candidate) => candidate.name.toLowerCase() === username?.toLowerCase());
+    if (!user || !(await verifyPassword(user, password))) {
       reply.code(401);
       return {
         type: "https://jellyfin.org/docs/general/server/api/",
@@ -143,13 +167,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
 
     const authInfo = parseAuthorization(request);
-    const dto = userDto(user.name, serverId, config.server.name);
+    const dto = userDto(user.name, snapshotServerId, snapshotConfig.server.name);
     const session = store.createSession(String(dto.Id), user.name, authInfo.deviceId, authInfo.device);
     return {
       User: dto,
-      SessionInfo: sessionInfo(session, config.server.name),
+      SessionInfo: sessionInfo(session, snapshotConfig.server.name),
       AccessToken: session.accessToken,
-      ServerId: serverId
+      ServerId: snapshotServerId
     };
   });
 
@@ -166,16 +190,22 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.get("/UserViews", async (request) => {
     const auth = requireSession(request, config, store);
     requireSelf(auth, userIdFromQuery(request.query));
-    await refreshLiveViewsForRequest(request.query);
-    return queryResult(viewDtos());
+    const snapshotConfig = config;
+    const snapshotServerId = serverId;
+    const client = upstream;
+    await refreshLiveViewsForRequest(snapshotConfig, client, request.query);
+    return queryResult(viewDtos(snapshotConfig, snapshotServerId));
   });
 
   app.get("/Users/:userId/Views", async (request) => {
     const auth = requireSession(request, config, store);
     const params = request.params as { userId: string };
     requireSelf(auth, params.userId);
-    await refreshLiveViewsForRequest(request.query);
-    return queryResult(viewDtos());
+    const snapshotConfig = config;
+    const snapshotServerId = serverId;
+    const client = upstream;
+    await refreshLiveViewsForRequest(snapshotConfig, client, request.query);
+    return queryResult(viewDtos(snapshotConfig, snapshotServerId));
   });
 
   app.get("/UserViews/GroupingOptions", async (request) => {
@@ -228,23 +258,27 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   });
   app.get("/Items/Latest", async (request) => {
     const auth = requireSession(request, config, store);
-    return await liveLatestItems(auth.user.name, request.query, request).catch(() => latestItems(auth.session.userId, request.query));
+    const snapshotConfig = config;
+    return await liveLatestItems(auth.user.name, request.query, request).catch(() => latestItems(snapshotConfig, auth.session.userId, request.query));
   });
   app.get("/Users/:userId/Items/Latest", async (request) => {
     const auth = requireSession(request, config, store);
     const params = request.params as { userId: string };
     const userIdValue = requireSelf(auth, params.userId);
-    return await liveLatestItems(auth.user.name, request.query, request).catch(() => latestItems(userIdValue, request.query));
+    const snapshotConfig = config;
+    return await liveLatestItems(auth.user.name, request.query, request).catch(() => latestItems(snapshotConfig, userIdValue, request.query));
   });
   app.get("/UserItems/Resume", async (request) => {
     const auth = requireSession(request, config, store);
-    return await liveQueryResult(auth.user.name, "/UserItems/Resume", request.query, request).catch(() => resumeItems(auth.session.userId, request.query));
+    const snapshotConfig = config;
+    return await liveQueryResult(auth.user.name, "/UserItems/Resume", request.query, request).catch(() => resumeItems(snapshotConfig, auth.session.userId, request.query));
   });
   app.get("/Users/:userId/Items/Resume", async (request) => {
     const auth = requireSession(request, config, store);
     const params = request.params as { userId: string };
     const userIdValue = requireSelf(auth, params.userId);
-    return await liveQueryResult(auth.user.name, "/UserItems/Resume", request.query, request).catch(() => resumeItems(userIdValue, request.query));
+    const snapshotConfig = config;
+    return await liveQueryResult(auth.user.name, "/UserItems/Resume", request.query, request).catch(() => resumeItems(snapshotConfig, userIdValue, request.query));
   });
   app.get("/Items/Suggestions", async (request) => {
     const auth = requireSession(request, config, store);
@@ -382,22 +416,24 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   app.get("/Shows/:seriesId/Seasons", async (request, reply) => {
     const auth = requireSession(request, config, store);
+    const snapshotConfig = config;
+    const client = upstream;
     const { seriesId } = request.params as { seriesId: string };
-    const seriesSources = bridgeItemSources(config, store, seriesId);
+    const seriesSources = bridgeItemSources(snapshotConfig, store, seriesId);
     if (seriesSources.length === 0) {
       const live = await liveQueryResult(auth.user.name, `/Shows/${seriesId}/Seasons`, request.query, request).catch(() => undefined);
       if (live) return live;
     }
     if (seriesSources.length === 0) return notFound(reply, "Series not found");
     const upstreamSeriesIds = new Set(seriesSources.map((source) => source.itemId));
-    let seasons = listBridgeItems(config, store, auth.session.userId)
+    let seasons = listBridgeItems(snapshotConfig, store, auth.session.userId)
       .filter((item) => String(item.Type).toLowerCase() === "season" && upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")));
     if (seasons.length === 0) {
-      await refreshLiveSeasons(seriesSources, request.query).catch((error: unknown) => {
+      await refreshLiveSeasons(client, seriesSources, request.query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream seasons failed: ${detail}`);
       });
-      seasons = listBridgeItems(config, store, auth.session.userId)
+      seasons = listBridgeItems(snapshotConfig, store, auth.session.userId)
         .filter((item) => String(item.Type).toLowerCase() === "season" && upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")));
     }
     return queryResult(seasons);
@@ -405,11 +441,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   app.get("/Shows/:seriesId/Episodes", async (request, reply) => {
     const auth = requireSession(request, config, store);
+    const snapshotConfig = config;
+    const client = upstream;
     const { seriesId } = request.params as { seriesId: string };
     const query = request.query as { Season?: string; season?: string; SeasonId?: string; seasonId?: string };
-    const seriesSources = bridgeItemSources(config, store, seriesId);
+    const seriesSources = bridgeItemSources(snapshotConfig, store, seriesId);
     const requestedSeasonId = query.SeasonId ?? query.seasonId;
-    const seasonSources = requestedSeasonId ? bridgeItemSources(config, store, requestedSeasonId) : [];
+    const seasonSources = requestedSeasonId ? bridgeItemSources(snapshotConfig, store, requestedSeasonId) : [];
     if (seriesSources.length === 0 && seasonSources.length === 0) {
       const live = await liveQueryResult(auth.user.name, `/Shows/${seriesId}/Episodes`, request.query, request).catch(() => undefined);
       if (live) return live;
@@ -418,17 +456,17 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const upstreamSeriesIds = new Set(seriesSources.map((source) => source.itemId));
     const upstreamSeasonIds = new Set(seasonSources.map((source) => source.itemId));
     const seasonNumber = query.Season ?? query.season;
-    let episodes = listBridgeItems(config, store, auth.session.userId)
+    let episodes = listBridgeItems(snapshotConfig, store, auth.session.userId)
       .filter((item) => String(item.Type).toLowerCase() === "episode")
       .filter((item) => upstreamSeriesIds.size === 0 || upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")))
       .filter((item) => upstreamSeasonIds.size === 0 || upstreamSeasonIds.has(String(item.SeasonIdSource ?? item.SeasonId ?? "")))
       .filter((item) => seasonNumber === undefined || String(item.ParentIndexNumber) === seasonNumber);
     if (episodes.length === 0) {
-      await refreshLiveEpisodes(seriesSources, seasonSources, request.query).catch((error: unknown) => {
+      await refreshLiveEpisodes(client, seriesSources, seasonSources, request.query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream episodes failed: ${detail}`);
       });
-      episodes = listBridgeItems(config, store, auth.session.userId)
+      episodes = listBridgeItems(snapshotConfig, store, auth.session.userId)
         .filter((item) => String(item.Type).toLowerCase() === "episode")
         .filter((item) => upstreamSeriesIds.size === 0 || upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")))
         .filter((item) => upstreamSeasonIds.size === 0 || upstreamSeasonIds.has(String(item.SeasonIdSource ?? item.SeasonId ?? "")))
@@ -439,9 +477,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   app.get("/Shows/NextUp", async (request) => {
     const auth = requireSession(request, config, store);
+    const snapshotConfig = config;
     const live = await liveQueryResult(auth.user.name, "/Shows/NextUp", request.query, request).catch(() => undefined);
     if (live) return live;
-    const episodes = listBridgeItems(config, store, auth.session.userId)
+    const episodes = listBridgeItems(snapshotConfig, store, auth.session.userId)
       .filter((item) => String(item.Type).toLowerCase() === "episode")
       .filter((item) => !Boolean((item.UserData as Record<string, unknown> | undefined)?.Played));
     return queryResult(episodes);
@@ -489,7 +528,8 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   app.delete("/Items/:itemId", async (request, reply) => {
     requireSession(request, config, store);
-    if (!upstream.raw) {
+    const client = upstream;
+    if (!client.raw) {
       unsupported(reply, "The configured upstream client does not support item deletion");
       return;
     }
@@ -502,7 +542,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
 
     try {
-      await upstream.raw(source.serverId, `/Items/${source.itemId}`, { method: "DELETE" });
+      await client.raw(source.serverId, `/Items/${source.itemId}`, { method: "DELETE" });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw badGatewayError(`Upstream item deletion failed: ${detail}`);
@@ -513,10 +553,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   });
 
   async function itemDetail(request: FastifyRequest, reply: FastifyReply, userName: string, userIdValue: string, itemId: string): Promise<Record<string, unknown> | void> {
-    const sources = bridgeItemSources(config, store, itemId);
-    const item = viewDtos().find((view) => view.Id === itemId)
+    const snapshotConfig = config;
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const sources = bridgeItemSources(snapshotConfig, store, itemId);
+    const item = viewDtos(snapshotConfig, bridgeServerIdValue).find((view) => view.Id === itemId)
       ?? (sources.length === 0 ? await getLiveItem(userName, itemId, request.query, request).catch(() => undefined) : undefined)
-      ?? await getHydratedBridgeItem(itemId, userIdValue, request.query);
+      ?? await getHydratedBridgeItem(itemId, userIdValue, request.query, snapshotConfig, client, bridgeServerIdValue);
     if (!item) return notFound(reply, "Item not found");
     return item;
   }
@@ -655,32 +698,34 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   return app;
 
   async function browseItems(userIdValue: string, query: BrowseQuery): Promise<Record<string, unknown>> {
+    const snapshotConfig = config;
+    const client = upstream;
     const unpagedQuery = { ...query, startIndex: undefined, limit: undefined };
-    const cachedTotal = queryBridgeItems(config, store, userIdValue, unpagedQuery).total;
+    const cachedTotal = queryBridgeItems(snapshotConfig, store, userIdValue, unpagedQuery).total;
     if (cachedTotal === 0) {
-      await refreshLiveBrowse(query).catch((error: unknown) => {
+      await refreshLiveBrowse(snapshotConfig, client, query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream browse failed: ${detail}`);
       });
     }
-    const result = queryBridgeItems(config, store, userIdValue, query);
+    const result = queryBridgeItems(snapshotConfig, store, userIdValue, query);
     return queryResult(result.items, query.startIndex ?? 0, result.total);
   }
 
-  async function refreshLiveBrowse(query: BrowseQuery): Promise<void> {
+  async function refreshLiveBrowse(snapshotConfig: BridgeConfig, client: AppUpstreamClient, query: BrowseQuery): Promise<void> {
     let attempted = false;
     let sawResponse = false;
     const refresh = async (serverIdValue: string, libraryIdValue: string) => {
       attempted = true;
       try {
-        await refreshLiveSource(serverIdValue, libraryIdValue, query);
+        await refreshLiveSource(client, serverIdValue, libraryIdValue, query);
         sawResponse = true;
       } catch (error) {
         if (!isIgnorableLiveSourceError(error)) throw error;
       }
     };
 
-    const libraries = mappedLibrariesForBrowse(query.parentId);
+    const libraries = mappedLibrariesForBrowse(snapshotConfig, query.parentId);
     for (const library of libraries) {
       for (const source of library.sources) {
         await refresh(source.server, source.libraryId);
@@ -697,17 +742,17 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
   }
 
-  function mappedLibrariesForBrowse(parentId: string | undefined): typeof config.libraries {
-    if (!parentId) return config.libraries;
-    const library = config.libraries.find((candidate) => bridgeLibraryId(candidate.id) === parentId);
+  function mappedLibrariesForBrowse(snapshotConfig: BridgeConfig, parentId: string | undefined): BridgeConfig["libraries"] {
+    if (!parentId) return snapshotConfig.libraries;
+    const library = snapshotConfig.libraries.find((candidate) => bridgeLibraryId(candidate.id) === parentId);
     return library ? [library] : [];
   }
 
-  async function refreshLiveSource(serverIdValue: string, libraryIdValue: string, query: BrowseQuery): Promise<void> {
+  async function refreshLiveSource(client: AppUpstreamClient, serverIdValue: string, libraryIdValue: string, query: BrowseQuery): Promise<void> {
     let startIndex = 0;
     let totalRecordCount = Number.POSITIVE_INFINITY;
     while (startIndex < totalRecordCount) {
-      const response = await upstream.json<{ Items?: SourceItem[]; TotalRecordCount?: number }>(serverIdValue, "/Items", {
+      const response = await client.json<{ Items?: SourceItem[]; TotalRecordCount?: number }>(serverIdValue, "/Items", {
         query: {
           ParentId: libraryIdValue,
           Recursive: true,
@@ -728,15 +773,18 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   async function liveLatestItems(userName: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>[]> {
     if (!liveRouteAggregation) throw new Error("Live route aggregation is disabled");
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const cacheVersion = configVersion;
     const sources = liveLibrarySources(rawQuery);
     logUpstreamFanout(request, "/Items/Latest", "/Items/Latest", sources);
     const candidates: LiveCandidate[] = [];
     let sawResponse = false;
     await Promise.all(sources.map(async (source) => {
       try {
-        const query = await liveQueryForSource(userName, rawQuery, source);
+        const query = await liveQueryForSource(client, cacheVersion, userName, rawQuery, source);
         logUpstreamJson(request, "/Items/Latest", source, "/Items/Latest");
-        const response = await upstream.json<unknown>(source.serverId, "/Items/Latest", { query });
+        const response = await client.json<unknown>(source.serverId, "/Items/Latest", { query });
         sawResponse = true;
         for (const item of liveItemsFromResponse(response)) {
           candidates.push({ source, item });
@@ -751,21 +799,24 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return mergeLiveCandidates(candidates)
       .sort(compareLiveDateCreatedDescending)
       .slice(0, limit)
-      .map(({ source, item }) => rewriteLiveDto(item, source));
+      .map(({ source, item }) => rewriteLiveDto(item, source, bridgeServerIdValue));
   }
 
   async function liveQueryResult(userName: string, path: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>> {
     if (!liveRouteAggregation) throw new Error("Live route aggregation is disabled");
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const cacheVersion = configVersion;
     const sources = path === "/UserItems/Resume" || path === "/Shows/NextUp" ? liveQuerySources(rawQuery) : liveUpstreamSources();
     logUpstreamFanout(request, path, path, sources);
     const candidates: LiveCandidate[] = [];
     let sawResponse = false;
 
     await Promise.all(sources.map(async (source) => {
-      const query = await liveQueryForSource(userName, rawQuery, source);
+      const query = await liveQueryForSource(client, cacheVersion, userName, rawQuery, source);
       try {
         logUpstreamJson(request, path, source, path);
-        const response = await upstream.json<unknown>(source.serverId, path, { query });
+        const response = await client.json<unknown>(source.serverId, path, { query });
         sawResponse = true;
         for (const item of liveItemsFromResponse(response)) {
           candidates.push({ source, item });
@@ -780,18 +831,22 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const limit = limitFrom(rawQuery);
     const merged = mergeLiveCandidates(candidates);
     const paged = limit === undefined ? merged.slice(startIndex) : merged.slice(startIndex, startIndex + limit);
-    return queryResult(paged.map(({ source, item }) => rewriteLiveDto(item, source)), startIndex, merged.length);
+    return queryResult(paged.map(({ source, item }) => rewriteLiveDto(item, source, bridgeServerIdValue)), startIndex, merged.length);
   }
 
   async function getLiveItem(userName: string, itemIdValue: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown> | undefined> {
     if (!liveRouteAggregation) return undefined;
-    logUpstreamFanout(request, `/Items/${itemIdValue}`, `/Items/${itemIdValue}`, liveUpstreamSources());
-    for (const source of liveUpstreamSources()) {
-      const query = await liveQueryForSource(userName, rawQuery, source);
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const cacheVersion = configVersion;
+    const sources = liveUpstreamSources();
+    logUpstreamFanout(request, `/Items/${itemIdValue}`, `/Items/${itemIdValue}`, sources);
+    for (const source of sources) {
+      const query = await liveQueryForSource(client, cacheVersion, userName, rawQuery, source);
       try {
         logUpstreamJson(request, `/Items/${itemIdValue}`, source, `/Items/${itemIdValue}`);
-        const item = await upstream.json<Record<string, unknown>>(source.serverId, `/Items/${itemIdValue}`, { query });
-        return rewriteLiveDto(item, source);
+        const item = await client.json<Record<string, unknown>>(source.serverId, `/Items/${itemIdValue}`, { query });
+        return rewriteLiveDto(item, source, bridgeServerIdValue);
       } catch (error) {
         if (!isIgnorableLiveSourceError(error)) throw error;
       }
@@ -880,28 +935,34 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }, "upstream json");
   }
 
-  async function liveQueryForSource(userName: string, rawQuery: unknown, source: LiveSource): Promise<Record<string, string | number | boolean | undefined>> {
+  async function liveQueryForSource(
+    client: AppUpstreamClient,
+    cacheVersion: number,
+    userName: string,
+    rawQuery: unknown,
+    source: LiveSource
+  ): Promise<Record<string, string | number | boolean | undefined>> {
     const query = stripBridgeUserQuery(rawQuery);
     if (source.libraryId && parentIdFrom(rawQuery)) {
       query.ParentId = source.libraryId;
       delete query.parentId;
     }
-    const upstreamUserId = await liveUserId(source.serverId, userName);
+    const upstreamUserId = await liveUserId(client, cacheVersion, source.serverId, userName);
     if (upstreamUserId) {
       query.UserId = upstreamUserId;
     }
     return query;
   }
 
-  async function liveUserId(serverIdValue: string, userName: string): Promise<string | undefined> {
-    const key = `${serverIdValue}:${userName.toLowerCase()}`;
+  async function liveUserId(client: AppUpstreamClient, cacheVersion: number, serverIdValue: string, userName: string): Promise<string | undefined> {
+    const key = `${cacheVersion}:${serverIdValue}:${userName.toLowerCase()}`;
     const cached = liveUserCache.get(key);
     const now = Date.now();
     if (cached && cached.expiresAt > now) {
       return cached.promise;
     }
 
-    const promise = fetchLiveUserId(serverIdValue, userName).catch(() => undefined);
+    const promise = fetchLiveUserId(client, serverIdValue, userName).catch(() => undefined);
     liveUserCache.set(key, { expiresAt: now + liveUserCacheTtlMs, promise });
     const resolved = await promise;
     if (resolved === undefined) {
@@ -910,9 +971,9 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return resolved;
   }
 
-  async function fetchLiveUserId(serverIdValue: string, userName: string): Promise<string | undefined> {
+  async function fetchLiveUserId(client: AppUpstreamClient, serverIdValue: string, userName: string): Promise<string | undefined> {
     try {
-      const users = await upstream.json<Array<{ Id: string; Name?: string }>>(serverIdValue, "/Users", {});
+      const users = await client.json<Array<{ Id: string; Name?: string }>>(serverIdValue, "/Users", {});
       return users.find((user) => user.Name?.toLowerCase() === userName.toLowerCase())?.Id ?? users[0]?.Id;
     } catch {
       return undefined;
@@ -937,17 +998,17 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return Array.from(byLogicalKey.values()).sort((left, right) => left.source.priority - right.source.priority);
   }
 
-  function rewriteLiveDto(item: Record<string, unknown>, source: LiveSource): Record<string, unknown> {
-    const rewritten = rewriteLiveValue(item, source);
+  function rewriteLiveDto(item: Record<string, unknown>, source: LiveSource, bridgeServerIdValue: string = serverId): Record<string, unknown> {
+    const rewritten = rewriteLiveValue(item, source, bridgeServerIdValue);
     return isRecord(rewritten) ? rewritten : item;
   }
 
-  function rewriteLiveValue(value: unknown, source: LiveSource): unknown {
-    if (Array.isArray(value)) return value.map((item) => rewriteLiveValue(item, source));
+  function rewriteLiveValue(value: unknown, source: LiveSource, bridgeServerIdValue: string): unknown {
+    if (Array.isArray(value)) return value.map((item) => rewriteLiveValue(item, source, bridgeServerIdValue));
     if (!isRecord(value)) return value;
 
     const object: Record<string, unknown> = { ...value };
-    if ("ServerId" in object) object.ServerId = serverId;
+    if ("ServerId" in object) object.ServerId = bridgeServerIdValue;
     for (const field of ["ParentId", "TopParentId"]) {
       if (source.libraryId && source.bridgeLibraryId && object[field] === source.libraryId) {
         object[field] = source.bridgeLibraryId;
@@ -959,7 +1020,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     for (const [key, child] of Object.entries(object)) {
       if (key === "UserData") continue;
       if (child && typeof child === "object") {
-        object[key] = rewriteLiveValue(child, source);
+        object[key] = rewriteLiveValue(child, source, bridgeServerIdValue);
       }
     }
     return object;
@@ -970,11 +1031,11 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return result === 0 ? left.source.priority - right.source.priority : result;
   }
 
-  async function refreshLiveSeasons(seriesSources: ReturnType<typeof bridgeItemSources>, query: unknown): Promise<void> {
+  async function refreshLiveSeasons(client: AppUpstreamClient, seriesSources: ReturnType<typeof bridgeItemSources>, query: unknown): Promise<void> {
     let sawResponse = false;
     for (const source of seriesSources) {
       try {
-        const response = await upstream.json<{ Items?: SourceItem[] }>(source.serverId, `/Shows/${source.itemId}/Seasons`, {
+        const response = await client.json<{ Items?: SourceItem[] }>(source.serverId, `/Shows/${source.itemId}/Seasons`, {
           query: stripBridgeUserQuery(query)
         });
         sawResponse = true;
@@ -987,6 +1048,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 
   async function refreshLiveEpisodes(
+    client: AppUpstreamClient,
     seriesSources: ReturnType<typeof bridgeItemSources>,
     seasonSources: ReturnType<typeof bridgeItemSources>,
     query: unknown
@@ -999,7 +1061,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         if (!upstreamSeriesId) continue;
         attempted = true;
         try {
-          const response = await upstream.json<{ Items?: SourceItem[] }>(seasonSource.serverId, `/Shows/${upstreamSeriesId}/Episodes`, {
+          const response = await client.json<{ Items?: SourceItem[] }>(seasonSource.serverId, `/Shows/${upstreamSeriesId}/Episodes`, {
             query: { ...stripBridgeUserQuery(query), SeasonId: seasonSource.itemId }
           });
           sawResponse = true;
@@ -1015,7 +1077,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     for (const source of seriesSources) {
       attempted = true;
       try {
-        const response = await upstream.json<{ Items?: SourceItem[] }>(source.serverId, `/Shows/${source.itemId}/Episodes`, {
+        const response = await client.json<{ Items?: SourceItem[] }>(source.serverId, `/Shows/${source.itemId}/Episodes`, {
           query: stripBridgeUserQuery(query)
         });
         sawResponse = true;
@@ -1040,14 +1102,15 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
   }
 
-  async function refreshLiveViewsForRequest(query: unknown): Promise<void> {
+  async function refreshLiveViewsForRequest(snapshotConfig: BridgeConfig, client: AppUpstreamClient, query: unknown): Promise<void> {
     if (!shouldRefreshLiveViews(query)) return;
-    for (const upstreamConfig of config.upstreams) {
+    const upstreamConfigs = snapshotConfig.upstreams;
+    for (const upstreamConfig of upstreamConfigs) {
       try {
-        const users = await upstream.json<Array<{ Id: string }>>(upstreamConfig.id, "/Users", {});
+        const users = await client.json<Array<{ Id: string }>>(upstreamConfig.id, "/Users", {});
         const user = users[0];
         if (!user) continue;
-        const response = await upstream.json<{ Items?: Array<{ Id: string; Name?: string; CollectionType?: string }> }>(upstreamConfig.id, "/UserViews", {
+        const response = await client.json<{ Items?: Array<{ Id: string; Name?: string; CollectionType?: string }> }>(upstreamConfig.id, "/UserViews", {
           query: { UserId: user.Id }
         });
         for (const item of response.Items ?? []) {
@@ -1069,14 +1132,21 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return "includeExternalContent" in record || "IncludeExternalContent" in record || "userId" in record || "UserId" in record;
   }
 
-  async function getHydratedBridgeItem(itemIdValue: string, userIdValue: string, query: unknown): Promise<Record<string, unknown> | undefined> {
-    const sources = bridgeItemSources(config, store, itemIdValue);
+  async function getHydratedBridgeItem(
+    itemIdValue: string,
+    userIdValue: string,
+    query: unknown,
+    snapshotConfig: BridgeConfig = config,
+    client: AppUpstreamClient = upstream,
+    bridgeServerIdValue: string = serverId
+  ): Promise<Record<string, unknown> | undefined> {
+    const sources = bridgeItemSources(snapshotConfig, store, itemIdValue);
     const source = sources[0];
     if (!source) return undefined;
 
-    const fallback = getBridgeItem(config, store, userIdValue, itemIdValue);
+    const fallback = getBridgeItem(snapshotConfig, store, userIdValue, itemIdValue);
     if (!shouldHydrateItem(query)) return fallback;
-    const upstreamItem = await upstream.json<Record<string, unknown>>(source.serverId, `/Items/${source.itemId}`, {
+    const upstreamItem = await client.json<Record<string, unknown>>(source.serverId, `/Items/${source.itemId}`, {
       query: stripBridgeUserQuery(query)
     }).catch(() => undefined);
     if (!upstreamItem) return fallback;
@@ -1089,7 +1159,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       },
       {
         serverId: source.serverId,
-        bridgeServerId: serverId,
+        bridgeServerId: bridgeServerIdValue,
         itemIdMap: new Map(sources.map((candidate) => [candidate.itemId, itemIdValue]))
       }
     ) as Record<string, unknown>;
@@ -1109,7 +1179,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 
   async function getPlaybackInfo(params: { itemId: string }, query: unknown, body: unknown, userIdValue: string, userName: string, request?: FastifyRequest): Promise<Record<string, unknown>> {
-    const sources = bridgeItemSources(config, store, params.itemId);
+    const snapshotConfig = config;
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const sources = bridgeItemSources(snapshotConfig, store, params.itemId);
     if (sources.length === 0) {
       const live = await getLivePlaybackInfo(userName, params.itemId, query, body, request).catch(() => undefined);
       if (live) return live;
@@ -1132,7 +1205,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         path: `/Items/${source.itemId}/PlaybackInfo`
       }
     }, "upstream binding");
-    const response = await upstream.json<Record<string, unknown>>(source.serverId, `/Items/${source.itemId}/PlaybackInfo`, {
+    const response = await client.json<Record<string, unknown>>(source.serverId, `/Items/${source.itemId}/PlaybackInfo`, {
       method: upstreamBody === undefined ? "GET" : "POST",
       query: upstreamQuery,
       body: upstreamBody
@@ -1142,7 +1215,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     });
     const rewritten = rewriteDto(response, {
       serverId: source.serverId,
-      bridgeServerId: serverId,
+      bridgeServerId: bridgeServerIdValue,
       itemIdMap: new Map(sources.map((candidate) => [candidate.itemId, params.itemId]))
     }) as Record<string, unknown>;
 
@@ -1158,7 +1231,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       });
       rewritten.PlaySessionId = mapping.bridgePlaySessionId;
     }
-    const bridgeItem = getBridgeItem(config, store, userIdValue, params.itemId);
+    const bridgeItem = getBridgeItem(snapshotConfig, store, userIdValue, params.itemId);
     if (bridgeItem) {
       rewritten.UserData = bridgeItem.UserData;
     }
@@ -1167,18 +1240,22 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   async function getLivePlaybackInfo(userName: string, itemIdValue: string, query: unknown, body: unknown, request?: FastifyRequest): Promise<Record<string, unknown> | undefined> {
     if (!liveRouteAggregation) return undefined;
-    logUpstreamFanout(request, `/Items/${itemIdValue}/PlaybackInfo`, `/Items/${itemIdValue}/PlaybackInfo`, liveUpstreamSources());
-    for (const source of liveUpstreamSources()) {
-      const upstreamQuery = await liveQueryForSource(userName, query, source);
-      const upstreamBody = await liveBodyForSource(userName, body, source);
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const cacheVersion = configVersion;
+    const sources = liveUpstreamSources();
+    logUpstreamFanout(request, `/Items/${itemIdValue}/PlaybackInfo`, `/Items/${itemIdValue}/PlaybackInfo`, sources);
+    for (const source of sources) {
+      const upstreamQuery = await liveQueryForSource(client, cacheVersion, userName, query, source);
+      const upstreamBody = await liveBodyForSource(client, cacheVersion, userName, body, source);
       try {
         logUpstreamJson(request, `/Items/${itemIdValue}/PlaybackInfo`, source, `/Items/${itemIdValue}/PlaybackInfo`);
-        const response = await upstream.json<Record<string, unknown>>(source.serverId, `/Items/${itemIdValue}/PlaybackInfo`, {
+        const response = await client.json<Record<string, unknown>>(source.serverId, `/Items/${itemIdValue}/PlaybackInfo`, {
           method: upstreamBody === undefined ? "GET" : "POST",
           query: upstreamQuery,
           body: upstreamBody
         });
-        return rewriteLiveDto(response, source);
+        return rewriteLiveDto(response, source, bridgeServerIdValue);
       } catch (error) {
         if (!isIgnorableLiveSourceError(error)) throw error;
       }
@@ -1186,10 +1263,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return undefined;
   }
 
-  async function liveBodyForSource(userName: string, body: unknown, source: LiveSource): Promise<unknown> {
+  async function liveBodyForSource(client: AppUpstreamClient, cacheVersion: number, userName: string, body: unknown, source: LiveSource): Promise<unknown> {
     if (!isRecord(body)) return body;
     const rewritten = { ...body };
-    const upstreamUserId = await liveUserId(source.serverId, userName);
+    const upstreamUserId = await liveUserId(client, cacheVersion, source.serverId, userName);
     if (upstreamUserId) {
       rewritten.UserId = upstreamUserId;
     }
@@ -1267,13 +1344,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return undefined;
   }
 
-  function viewDtos(): Record<string, unknown>[] {
-    const mapped = new Set(config.libraries.flatMap((library) => library.sources.map((source) => `${source.server}:${source.libraryId}`)));
-    const upstreamNames = new Map(config.upstreams.map((upstreamConfig) => [upstreamConfig.id, upstreamConfig.name]));
-    const merged = config.libraries.map((library) => libraryDto(library, serverId));
+  function viewDtos(snapshotConfig: BridgeConfig = config, snapshotServerId: string = serverId): Record<string, unknown>[] {
+    const mapped = new Set(snapshotConfig.libraries.flatMap((library) => library.sources.map((source) => `${source.server}:${source.libraryId}`)));
+    const upstreamNames = new Map(snapshotConfig.upstreams.map((upstreamConfig) => [upstreamConfig.id, upstreamConfig.name]));
+    const merged = snapshotConfig.libraries.map((library) => libraryDto(library, snapshotServerId));
     const passThrough = store.listUpstreamLibraries()
       .filter((library) => !mapped.has(`${library.serverId}:${library.libraryId}`))
-      .map((library) => passThroughLibraryDto(library, upstreamNames.get(library.serverId) ?? library.serverId, serverId));
+      .map((library) => passThroughLibraryDto(library, upstreamNames.get(library.serverId) ?? library.serverId, snapshotServerId));
     return [...merged, ...passThrough];
   }
 
@@ -1318,10 +1395,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     };
   }
 
-  function latestItems(userIdValue: string, rawQuery: unknown): Record<string, unknown>[] {
+  function latestItems(snapshotConfig: BridgeConfig, userIdValue: string, rawQuery: unknown): Record<string, unknown>[] {
     const query = browseQuery(rawQuery);
     const limit = ((rawQuery ?? {}) as { Limit?: string; limit?: string }).Limit ?? ((rawQuery ?? {}) as { Limit?: string; limit?: string }).limit;
-    return listBridgeItems(config, store, userIdValue, {
+    return listBridgeItems(snapshotConfig, store, userIdValue, {
       ...query,
       sortBy: "DateCreated",
       sortOrder: "Descending",
@@ -1329,9 +1406,9 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     });
   }
 
-  function resumeItems(userIdValue: string, rawQuery: unknown): Record<string, unknown> {
+  function resumeItems(snapshotConfig: BridgeConfig, userIdValue: string, rawQuery: unknown): Record<string, unknown> {
     const query = browseQuery(rawQuery);
-    const unpaged = listBridgeItems(config, store, userIdValue, { ...query, startIndex: undefined, limit: undefined })
+    const unpaged = listBridgeItems(snapshotConfig, store, userIdValue, { ...query, startIndex: undefined, limit: undefined })
       .filter((item) => Number((item.UserData as Record<string, unknown> | undefined)?.PlaybackPositionTicks ?? 0) > 0);
     const start = query.startIndex ?? 0;
     const items = unpaged.slice(start, query.limit === undefined ? undefined : start + query.limit);
@@ -1389,7 +1466,8 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   async function proxyProgressiveStream(kind: "Videos" | "Audio", request: FastifyRequest, reply: FastifyReply): Promise<void> {
     requireSession(request, config, store);
-    if (!upstream.raw) {
+    const client = upstream;
+    if (!client.raw) {
       unsupported(reply, "The configured upstream client does not support raw proxying");
       return;
     }
@@ -1405,7 +1483,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       const streamPath = params.container === undefined
         ? `/${kind}/${params.itemId}/stream`
         : `/${kind}/${params.itemId}/stream.${params.container}`;
-      const response = await proxyRawFirst(request, `${kind.toLowerCase()} progressive stream`, liveUpstreamSources(), streamPath, {
+      const response = await proxyRawFirst(client, request, `${kind.toLowerCase()} progressive stream`, liveUpstreamSources(), streamPath, {
         method: request.method,
         query,
         headers: copyProxyRequestHeaders(request.headers)
@@ -1422,7 +1500,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const streamPath = params.container === undefined
       ? `/${kind}/${mapping.upstreamItemId}/stream`
       : `/${kind}/${mapping.upstreamItemId}/stream.${params.container}`;
-    const response = await proxyRaw(request, mapping.serverId, streamPath, {
+    const response = await proxyRaw(client, request, mapping.serverId, streamPath, {
       method: request.method,
       query: upstreamQuery,
       headers: copyProxyRequestHeaders(request.headers)
@@ -1433,7 +1511,8 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   async function proxyHlsPlaylist(kind: "Videos" | "Audio", request: FastifyRequest, reply: FastifyReply): Promise<void> {
     requireSession(request, config, store);
-    if (!upstream.raw) {
+    const client = upstream;
+    if (!client.raw) {
       unsupported(reply, "The configured upstream client does not support raw proxying");
       return;
     }
@@ -1446,7 +1525,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
     const mapping = resolveMediaSourceMapping(mediaSourceId, params.itemId);
     if (!mapping && liveRouteAggregation) {
-      const response = await proxyRawFirst(request, `${kind.toLowerCase()} hls playlist`, liveUpstreamSources(), `/${kind}/${params.itemId}/${params.playlist}.m3u8`, {
+      const response = await proxyRawFirst(client, request, `${kind.toLowerCase()} hls playlist`, liveUpstreamSources(), `/${kind}/${params.itemId}/${params.playlist}.m3u8`, {
         method: request.method,
         query,
         headers: copyProxyRequestHeaders(request.headers)
@@ -1468,7 +1547,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       return;
     }
 
-    const response = await proxyRaw(request, mapping.serverId, `/${kind}/${mapping.upstreamItemId}/${params.playlist}.m3u8`, {
+    const response = await proxyRaw(client, request, mapping.serverId, `/${kind}/${mapping.upstreamItemId}/${params.playlist}.m3u8`, {
       method: request.method,
       query: { ...query, MediaSourceId: mapping.upstreamMediaSourceId },
       headers: copyProxyRequestHeaders(request.headers)
@@ -1486,7 +1565,8 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 
   async function proxyItemImage(request: FastifyRequest, reply: FastifyReply): Promise<void> {
-    if (!upstream.raw) {
+    const client = upstream;
+    if (!client.raw) {
       unsupported(reply, "The configured upstream client does not support raw proxying");
       return;
     }
@@ -1504,7 +1584,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
           return path ? { serverId: source.serverId, path } : undefined;
         })
         .filter((candidate): candidate is RawProxyCandidate => candidate !== undefined);
-      const response = await tryProxyRawCandidates(request, "indexed item image", candidates, {
+      const response = await tryProxyRawCandidates(client, request, "indexed item image", candidates, {
         method: request.method,
         query: request.query,
         headers: copyProxyRequestHeaders(request.headers)
@@ -1517,7 +1597,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       return;
     }
     if (liveRouteAggregation) {
-      const directResponse = await tryProxyRawCandidates(request, "live item image", liveUpstreamSources().map((source) => ({
+      const directResponse = await tryProxyRawCandidates(client, request, "live item image", liveUpstreamSources().map((source) => ({
         serverId: source.serverId,
         path: directImagePath
       })), {
@@ -1535,14 +1615,15 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   async function proxyHlsSegment(kind: "Videos" | "Audio", request: FastifyRequest, reply: FastifyReply): Promise<void> {
     requireSession(request, config, store);
-    if (!upstream.raw) {
+    const client = upstream;
+    if (!client.raw) {
       unsupported(reply, "The configured upstream client does not support raw proxying");
       return;
     }
     const params = request.params as { itemId: string; mediaSourceId: string; playlistId: string; segmentId: string; container: string };
     const mapping = resolveMediaSourceMapping(params.mediaSourceId, params.itemId);
     if (!mapping && liveRouteAggregation) {
-      const response = await proxyRawFirst(request, `${kind.toLowerCase()} hls segment`, liveUpstreamSources(), `/${kind}/${params.itemId}/hls/${params.playlistId}/${params.segmentId}.${params.container}`, {
+      const response = await proxyRawFirst(client, request, `${kind.toLowerCase()} hls segment`, liveUpstreamSources(), `/${kind}/${params.itemId}/hls/${params.playlistId}/${params.segmentId}.${params.container}`, {
         method: request.method,
         query: request.query,
         headers: copyProxyRequestHeaders(request.headers)
@@ -1554,7 +1635,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       notFound(reply, "Media source mapping not found");
       return;
     }
-    const response = await proxyRaw(request, mapping.serverId, `/${kind}/${mapping.upstreamItemId}/hls/${params.playlistId}/${params.segmentId}.${params.container}`, {
+    const response = await proxyRaw(client, request, mapping.serverId, `/${kind}/${mapping.upstreamItemId}/hls/${params.playlistId}/${params.segmentId}.${params.container}`, {
       method: request.method,
       query: request.query,
       headers: copyProxyRequestHeaders(request.headers)
@@ -1564,7 +1645,8 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   async function proxySubtitleStream(request: FastifyRequest, reply: FastifyReply): Promise<void> {
     requireSession(request, config, store);
-    if (!upstream.raw) {
+    const client = upstream;
+    if (!client.raw) {
       unsupported(reply, "The configured upstream client does not support raw proxying");
       return;
     }
@@ -1574,7 +1656,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       const subtitlePath = params.startPositionTicks === undefined
         ? `/Videos/${params.itemId}/${params.mediaSourceId}/Subtitles/${params.index}/Stream.${params.format}`
         : `/Videos/${params.itemId}/${params.mediaSourceId}/Subtitles/${params.index}/${params.startPositionTicks}/Stream.${params.format}`;
-      const response = await proxyRawFirst(request, "subtitle stream", liveUpstreamSources(), subtitlePath, {
+      const response = await proxyRawFirst(client, request, "subtitle stream", liveUpstreamSources(), subtitlePath, {
         method: request.method,
         query: request.query,
         headers: copyProxyRequestHeaders(request.headers)
@@ -1589,7 +1671,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const subtitlePath = params.startPositionTicks === undefined
       ? `/Videos/${mapping.upstreamItemId}/${mapping.upstreamMediaSourceId}/Subtitles/${params.index}/Stream.${params.format}`
       : `/Videos/${mapping.upstreamItemId}/${mapping.upstreamMediaSourceId}/Subtitles/${params.index}/${params.startPositionTicks}/Stream.${params.format}`;
-    const response = await proxyRaw(request, mapping.serverId, subtitlePath, {
+    const response = await proxyRaw(client, request, mapping.serverId, subtitlePath, {
       method: request.method,
       query: request.query,
       headers: copyProxyRequestHeaders(request.headers)
@@ -1597,18 +1679,18 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     await sendProxyBody(reply, response);
   }
 
-  async function proxyRaw(request: FastifyRequest, serverIdValue: string, path: string, init: unknown): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: unknown }> {
+  async function proxyRaw(client: AppUpstreamClient, request: FastifyRequest, serverIdValue: string, path: string, init: unknown): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: unknown }> {
     try {
       request.log.info({ proxyPurpose: "mapped proxy", upstreamBinding: { serverId: serverIdValue, path } }, "upstream proxy");
-      return await upstream.raw!(serverIdValue, path, init);
+      return await client.raw!(serverIdValue, path, init);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       throw badGatewayError(`Upstream proxy failed: ${detail}`);
     }
   }
 
-  async function proxyRawFirst(request: FastifyRequest, purpose: string, sources: LiveSource[], path: string, init: unknown): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: unknown }> {
-    const response = await tryProxyRawCandidates(request, purpose, sources.map((source) => ({
+  async function proxyRawFirst(client: AppUpstreamClient, request: FastifyRequest, purpose: string, sources: LiveSource[], path: string, init: unknown): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: unknown }> {
+    const response = await tryProxyRawCandidates(client, request, purpose, sources.map((source) => ({
       serverId: source.serverId,
       path
     })), init);
@@ -1617,6 +1699,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 
   async function tryProxyRawCandidates(
+    client: AppUpstreamClient,
     request: FastifyRequest,
     purpose: string,
     candidates: RawProxyCandidate[],
@@ -1631,7 +1714,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
             path: candidate.path
           }
         }, "upstream proxy");
-        return await upstream.raw!(candidate.serverId, candidate.path, init);
+        return await client.raw!(candidate.serverId, candidate.path, init);
       } catch (error) {
         if (!isIgnorableLiveSourceError(error)) {
           const detail = error instanceof Error ? error.message : String(error);
@@ -1679,6 +1762,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 
   async function forwardPlaybackReport(path: string, body: unknown, userName: string): Promise<void> {
+    const client = upstream;
     const report = body && typeof body === "object" ? { ...(body as Record<string, unknown>) } : {};
     const mediaSourceId = typeof report.MediaSourceId === "string" ? report.MediaSourceId : undefined;
     if (!mediaSourceId) {
@@ -1698,7 +1782,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       report.PlaySessionId = playbackSession.upstreamPlaySessionId;
     }
     try {
-      await upstream.json(mapping.serverId, path, {
+      await client.json(mapping.serverId, path, {
         method: "POST",
         body: report
       });
@@ -1708,10 +1792,12 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 
   async function forwardLivePlaybackReport(path: string, report: Record<string, unknown>, userName: string): Promise<void> {
+    const client = upstream;
+    const cacheVersion = configVersion;
     await Promise.all(liveUpstreamSources().map(async (source) => {
-      const body = await liveBodyForSource(userName, report, source);
+      const body = await liveBodyForSource(client, cacheVersion, userName, report, source);
       try {
-        await upstream.json(source.serverId, path, {
+        await client.json(source.serverId, path, {
           method: "POST",
           body
         });
@@ -1720,6 +1806,21 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       }
     }));
   }
+}
+
+function toRuntimeConfigSource(config: BridgeConfig | RuntimeConfigSource): RuntimeConfigSource {
+  if (isRuntimeConfigSource(config)) {
+    return config;
+  }
+  const staticConfig = config;
+  return {
+    current: () => staticConfig,
+    subscribe: () => () => {}
+  };
+}
+
+function isRuntimeConfigSource(config: BridgeConfig | RuntimeConfigSource): config is RuntimeConfigSource {
+  return typeof (config as RuntimeConfigSource).current === "function";
 }
 
 function stripEmbyBasePath(url: string): string {
