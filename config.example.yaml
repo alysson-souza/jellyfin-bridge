@@ -1,4 +1,4 @@
-# yaml-language-server: $schema=./config.schema.json
+# yaml-language-server: $schema=https://raw.githubusercontent.com/alysson-souza/jellyfin-bridge/main/config.schema.json
 
 # The bridge listens here. publicUrl is the URL your clients use.
 server:
