@@ -41,9 +41,9 @@ let refreshScheduler: ScanScheduler | undefined;
 let fullScanScheduler: ScanScheduler | undefined;
 let scanIntervalMinutes = 0;
 let fullScanIntervalMinutes = 0;
-reconcileScanSchedulers(config);
 
 const app = buildApp({ config: runtimeConfig, store, upstreamFactory: (upstreams) => new UpstreamClient(upstreams) });
+reconcileScanSchedulers(config);
 const configWatcher = startRuntimeConfigReload(runtimeConfig, (nextConfig) => {
   const previousConfig = config;
   config = nextConfig;
@@ -83,14 +83,14 @@ function reconcileScanSchedulers(nextConfig: typeof config): void {
   if (nextScanIntervalMinutes !== scanIntervalMinutes) {
     refreshScheduler?.stop();
     refreshScheduler = nextScanIntervalMinutes > 0
-      ? startScanScheduler(() => new Indexer(runtimeConfig.current(), store, upstream).refreshAllLibraries(), nextScanIntervalMinutes * 60_000)
+      ? startScanScheduler(() => new Indexer(runtimeConfig.current(), store, upstream).refreshAllLibraries(), nextScanIntervalMinutes * 60_000, globalThis, app.log)
       : undefined;
     scanIntervalMinutes = nextScanIntervalMinutes;
   }
   if (nextFullScanIntervalMinutes !== fullScanIntervalMinutes) {
     fullScanScheduler?.stop();
     fullScanScheduler = nextFullScanIntervalMinutes > 0
-      ? startScanScheduler(() => new Indexer(runtimeConfig.current(), store, upstream).scanAllLibraries(), nextFullScanIntervalMinutes * 60_000)
+      ? startScanScheduler(() => new Indexer(runtimeConfig.current(), store, upstream).scanAllLibraries(), nextFullScanIntervalMinutes * 60_000, globalThis, app.log)
       : undefined;
     fullScanIntervalMinutes = nextFullScanIntervalMinutes;
   }

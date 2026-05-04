@@ -38,6 +38,21 @@ test("skips overlapping scheduled scans", async () => {
   await first;
 });
 
+test("logs scheduled scan failures without surfacing an unhandled rejection", async () => {
+  const timers = new FakeTimers();
+  const logger = new FakeLogger();
+  const error = new Error("scan failed");
+  startScanScheduler(async () => {
+    throw error;
+  }, 1000, timers, logger);
+
+  await timers.tick();
+  await Promise.resolve();
+
+  assert.equal(logger.message, "Scheduled scan failed");
+  assert.equal((logger.details as { error: Error }).error, error);
+});
+
 class FakeTimers implements SchedulerTimers {
   intervalMs = 0;
   cleared = false;
@@ -56,5 +71,15 @@ class FakeTimers implements SchedulerTimers {
   async tick(): Promise<void> {
     this.callback?.();
     await Promise.resolve();
+  }
+}
+
+class FakeLogger {
+  details: unknown;
+  message: string | undefined;
+
+  error(details: unknown, message?: string): void {
+    this.details = details;
+    this.message = message;
   }
 }

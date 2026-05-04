@@ -32,11 +32,22 @@ export class UpstreamClient {
   }
 
   async json<T>(serverId: string, path: string, init: { method?: string; body?: unknown; query?: Record<string, string | number | boolean | undefined> } = {}): Promise<T> {
-    const response = await this.raw(serverId, path, init);
-    if (!hasJsonBody(response.body)) {
-      throw new Error(`Upstream ${serverId} returned a non-JSON body for ${path}`);
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= this.retries; attempt += 1) {
+      const response = await this.raw(serverId, path, init);
+      if (!hasJsonBody(response.body)) {
+        throw new Error(`Upstream ${serverId} returned a non-JSON body for ${path}`);
+      }
+      try {
+        return await response.body.json() as T;
+      } catch (error) {
+        lastError = error;
+        if (!isRetryableBodyReadError(error) || attempt === this.retries) {
+          throw normalizeUpstreamError(serverId, path, error);
+        }
+      }
     }
-    return response.body.json() as Promise<T>;
+    throw normalizeUpstreamError(serverId, path, lastError);
   }
 
   async raw(serverId: string, path: string, init: { method?: string; body?: unknown; query?: Record<string, string | number | boolean | undefined>; headers?: Record<string, string> } = {}) {
@@ -91,6 +102,15 @@ function isHttpError(error: unknown): boolean {
 
 function isRetryableStatus(statusCode: number): boolean {
   return statusCode === 408 || statusCode === 429 || statusCode >= 500;
+}
+
+function isRetryableBodyReadError(error: unknown): boolean {
+  const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined;
+  return code === "ECONNRESET"
+    || code === "ETIMEDOUT"
+    || code === "UND_ERR_BODY_TIMEOUT"
+    || code === "UND_ERR_HEADERS_TIMEOUT"
+    || code === "UND_ERR_SOCKET";
 }
 
 function normalizeUpstreamError(serverId: string, path: string, error: unknown): Error {

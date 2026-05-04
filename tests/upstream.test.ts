@@ -98,6 +98,38 @@ test("new upstream client instances use updated configuration for future request
   ]);
 });
 
+test("retries when an upstream socket closes while reading a JSON body", async () => {
+  let attempts = 0;
+  const client = new UpstreamClient(
+    [{ id: "main", name: "Main", url: "https://example.com", token: "token" }],
+    {
+      request: async () => {
+        attempts += 1;
+        if (attempts === 1) {
+          return {
+            statusCode: 200,
+            headers: {},
+            body: {
+              json: async () => {
+                const error = new Error("other side closed") as Error & { code?: string };
+                error.code = "UND_ERR_SOCKET";
+                throw error;
+              }
+            }
+          };
+        }
+        return response(200, { ok: true });
+      },
+      retries: 1
+    }
+  );
+
+  const body = await client.json<{ ok: boolean }>("main", "/Items");
+
+  assert.deepEqual(body, { ok: true });
+  assert.equal(attempts, 2);
+});
+
 function response(statusCode: number, body: unknown) {
   return {
     statusCode,

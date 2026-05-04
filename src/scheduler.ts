@@ -8,7 +8,16 @@ export interface SchedulerTimers {
   clearInterval(handle: unknown): void;
 }
 
-export function startScanScheduler(scan: () => Promise<void>, intervalMs: number, timers: SchedulerTimers = globalThis): ScanScheduler {
+export interface ScanLogger {
+  error(details: unknown, message?: string): void;
+}
+
+export function startScanScheduler(
+  scan: () => Promise<void>,
+  intervalMs: number,
+  timers: SchedulerTimers = globalThis,
+  logger?: ScanLogger
+): ScanScheduler {
   if (!Number.isFinite(intervalMs) || intervalMs <= 0) {
     throw new Error("Scan interval must be greater than zero");
   }
@@ -26,7 +35,9 @@ export function startScanScheduler(scan: () => Promise<void>, intervalMs: number
   };
 
   const handle = timers.setInterval(() => {
-    void runNow();
+    void runNow().catch((error: unknown) => {
+      logger?.error({ error }, "Scheduled scan failed");
+    });
   }, intervalMs);
   if (handle && typeof handle === "object" && "unref" in handle && typeof handle.unref === "function") {
     handle.unref();
