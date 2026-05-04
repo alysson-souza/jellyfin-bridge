@@ -144,8 +144,12 @@ export class Store {
   }
 
   upsertIndexedItem(item: IndexedItemRecord): void {
-    const bridgeItemId = makeBridgeItemId(item.logicalKey);
-    this.db.prepare(`
+    this.upsertIndexedItems([item]);
+  }
+
+  upsertIndexedItems(items: IndexedItemRecord[]): void {
+    if (items.length === 0) return;
+    const upsert = this.db.prepare(`
       INSERT INTO indexed_items (server_id, item_id, library_id, item_type, logical_key, bridge_item_id, provider_key, json, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(server_id, item_id) DO UPDATE SET
@@ -156,17 +160,29 @@ export class Store {
         provider_key = excluded.provider_key,
         json = excluded.json,
         updated_at = excluded.updated_at
-    `).run(
-      item.serverId,
-      item.itemId,
-      item.libraryId,
-      item.itemType,
-      item.logicalKey,
-      bridgeItemId,
-      item.logicalKey,
-      JSON.stringify(item.json),
-      new Date().toISOString()
-    );
+    `);
+    const now = new Date().toISOString();
+    this.db.exec("BEGIN");
+    try {
+      for (const item of items) {
+        const bridgeItemId = makeBridgeItemId(item.logicalKey);
+        upsert.run(
+          item.serverId,
+          item.itemId,
+          item.libraryId,
+          item.itemType,
+          item.logicalKey,
+          bridgeItemId,
+          item.logicalKey,
+          JSON.stringify(item.json),
+          now
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   replaceIndexedItems(serverId: string, libraryId: string, items: IndexedItemRecord[]): void {

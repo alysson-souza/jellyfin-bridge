@@ -175,9 +175,7 @@ export class Indexer {
     this.store.markScanStarted(scope);
     try {
       for await (const page of this.fetchSourcePages(serverId, libraryId, this.cursorWithSafety(cursor.cursorAt))) {
-        for (const item of page) {
-          this.store.upsertIndexedItem(this.indexedItem(serverId, libraryId, item));
-        }
+        this.store.upsertIndexedItems(page.map((item) => this.indexedItem(serverId, libraryId, item)));
       }
       this.store.markScanCursor(scope, scanStartedAt);
       this.store.markScanSucceeded(scope);

@@ -131,6 +131,37 @@ test("refreshes configured libraries incrementally from the saved source cursor"
   store.close();
 });
 
+test("batches incremental refresh item writes", async () => {
+  const store = new Store(":memory:");
+  store.markScanCursor("source:main:library-a", "2026-05-01T00:00:00.000Z");
+  const upsertIndexedItem = store.upsertIndexedItem.bind(store);
+  let singleItemWrites = 0;
+  store.upsertIndexedItem = (item) => {
+    singleItemWrites += 1;
+    upsertIndexedItem(item);
+  };
+  const client = new FakeClient({
+    "main:/Items?ParentId=library-a&Recursive=true&StartIndex=0&Limit=500&MinDateLastSaved=2026-05-01T00%3A00%3A00.000Z": {
+      Items: [
+        { Id: "new-a", Type: "Movie", ProviderIds: { Tmdb: "1" } },
+        { Id: "new-b", Type: "Movie", ProviderIds: { Tmdb: "2" } }
+      ],
+      TotalRecordCount: 2,
+      StartIndex: 0
+    }
+  });
+  const indexer = new Indexer(config, store, client, {
+    incrementalSafetyMs: 0,
+    now: () => new Date("2026-05-02T00:00:00.000Z")
+  });
+
+  await indexer.refreshConfiguredLibraries();
+
+  assert.equal(singleItemWrites, 0);
+  assert.deepEqual(store.listIndexedItems().map((item) => item.itemId), ["new-a", "new-b"]);
+  store.close();
+});
+
 test("keeps the previous source cursor and rows when an incremental refresh fails", async () => {
   const store = new Store(":memory:");
   store.upsertIndexedItem({
