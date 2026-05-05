@@ -1,6 +1,6 @@
 import type { BridgeConfig } from "./config.js";
 import { bridgeItemId, bridgeLibraryId, bridgeServerId, passThroughLibraryId } from "./ids.js";
-import { rewriteDto } from "./rewriter.js";
+import { ITEM_ID_FIELDS, rewriteDto } from "./rewriter.js";
 import type { IndexedItemRecord, Store } from "./store.js";
 
 export interface BrowseQuery {
@@ -123,6 +123,24 @@ export function bridgeItemSources(config: BridgeConfig, store: Store, itemId: st
   return sortSourcesByPriority(config, store.findIndexedItemsByBridgeId(itemId));
 }
 
+export function bridgeItemIdMapForSourceItem(
+  store: Store,
+  serverId: string,
+  sources: IndexedItemRecord[],
+  bridgeId: string,
+  item: Record<string, unknown>
+): Map<string, string> {
+  const itemIdMap = new Map(sources.map((source) => [source.itemId, bridgeId]));
+  for (const field of ITEM_ID_FIELDS) {
+    const value = item[field];
+    if (field !== "Id" && typeof value === "string") {
+      const related = store.findIndexedItemsBySourceId(value).find((candidate) => candidate.serverId === serverId);
+      if (related) itemIdMap.set(value, bridgeItemId(related.logicalKey));
+    }
+  }
+  return itemIdMap;
+}
+
 export function itemCounts(store: Store): Record<string, number> {
   const groups = groupByLogicalKey(store.listIndexedItems());
   const counts = {
@@ -156,7 +174,7 @@ export function itemCounts(store: Store): Record<string, number> {
 function toBridgeItem(config: BridgeConfig, store: Store, userId: string, sources: IndexedItemRecord[]): Record<string, unknown> {
   const selected = defaultSource(config, sources);
   const id = bridgeItemId(selected.logicalKey);
-  const itemIdMap = new Map(sources.map((source) => [source.itemId, id]));
+  const itemIdMap = bridgeItemIdMapForSourceItem(store, selected.serverId, sources, id, selected.json);
   const rewritten = rewriteDto(
     {
       ...selected.json,

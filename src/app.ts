@@ -6,7 +6,7 @@ import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId, pas
 import { rewriteHlsPlaylist } from "./hls.js";
 import { Indexer } from "./indexer.js";
 import { libraryDto, passThroughLibraryDto, publicSystemInfo, queryResult, sessionInfo, systemInfo, userDataDto } from "./jellyfin.js";
-import { bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, queryBridgeItems } from "./library.js";
+import { bridgeItemIdMapForSourceItem, bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, queryBridgeItems } from "./library.js";
 import type { BrowseQuery } from "./library.js";
 import { logicalItemKey, type SourceItem } from "./merge.js";
 import { findMetadataItem, listAlbumArtists, listArtists, listGenres, listPersons, listStudios, listYears } from "./metadata.js";
@@ -1204,7 +1204,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       {
         serverId: source.serverId,
         bridgeServerId: bridgeServerIdValue,
-        itemIdMap: new Map(sources.map((candidate) => [candidate.itemId, itemIdValue]))
+        itemIdMap: bridgeItemIdMapForSourceItem(store, source.serverId, sources, itemIdValue, upstreamItem)
       }
     ) as Record<string, unknown>;
     rewritten.Id = itemIdValue;

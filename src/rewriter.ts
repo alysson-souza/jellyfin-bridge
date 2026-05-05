@@ -6,7 +6,7 @@ export interface RewriteContext {
   itemIdMap?: Map<string, string>;
 }
 
-const ITEM_ID_FIELDS = [
+export const ITEM_ID_FIELDS = [
   "Id",
   "ParentId",
   "SeriesId",

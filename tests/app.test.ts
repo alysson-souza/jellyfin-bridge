@@ -2341,10 +2341,21 @@ test("narrows live latest TV libraries to episodes like Jellyfin user views", as
           ? [{ Id: "episode-a", Type: "Episode", Name: "Latest Episode", SeriesId: "series-a", ParentIndexNumber: 1, IndexNumber: 1, DateCreated: "2026-01-02T00:00:00.000Z" }]
           : [{ Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1, DateCreated: "2026-01-03T00:00:00.000Z" }]) as T;
       }
+      if (path === "/Shows/series-a/Seasons") {
+        return { Items: [{ Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }], TotalRecordCount: 1, StartIndex: 0 } as T;
+      }
       throw new Error(`Unexpected upstream request ${serverId}:${path}`);
     }
   };
   const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "shows-lib",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "series-a", Type: "Series", Name: "Example Series", ProviderIds: { Tvdb: "100" } }
+  });
   const app = buildApp({ config, store, upstream });
   const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
 
@@ -2356,7 +2367,16 @@ test("narrows live latest TV libraries to episodes like Jellyfin user views", as
 
   assert.equal(latest.statusCode, 200);
   assert.deepEqual(latest.json().map((item: any) => [item.Type, item.Name]), [["Episode", "Latest Episode"]]);
+  assert.equal(latest.json()[0].SeriesId, bridgeItemId("series:tvdb:100"));
   assert.equal(upstream.requests.find((request) => request.path === "/Items/Latest")?.init.query.IncludeItemTypes, "Episode");
+
+  const seasons = await app.inject({
+    method: "GET",
+    url: `/Shows/${latest.json()[0].SeriesId}/Seasons`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(seasons.statusCode, 200);
+  assert.deepEqual(seasons.json().Items.map((item: any) => item.Name), ["Season 1"]);
 
   await app.close();
   store.close();
