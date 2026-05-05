@@ -42,13 +42,6 @@ interface LiveCandidate {
 
 type LiveQueryParams = Record<string, string | number | boolean | undefined>;
 
-interface LivePageFetch {
-  source: LiveSource;
-  query: LiveQueryParams;
-  fetched: number;
-  total: number;
-}
-
 interface RawProxyCandidate {
   serverId: string;
   path: string;
@@ -896,7 +889,6 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const sources = path === "/UserItems/Resume" || path === "/Shows/NextUp" ? liveQuerySources(path, rawQuery) : liveUpstreamSources();
     logUpstreamFanout(request, path, path, sources);
     const candidates: LiveCandidate[] = [];
-    const pageFetches: LivePageFetch[] = [];
     let sawResponse = false;
     let upstreamTotalRecordCount = 0;
 
@@ -909,7 +901,6 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         const total = liveTotalRecordCountFromResponse(response);
         const items = liveItemsFromResponse(response);
         upstreamTotalRecordCount += total;
-        pageFetches.push({ source, query, fetched: items.length, total });
         for (const item of items) {
           if (source.libraryId) {
             await ensureRelatedLiveItems(client, cacheVersion, userName, source, item);
@@ -925,43 +916,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     if (!sawResponse) throw new Error(`No upstream response for ${path}`);
     const startIndex = startIndexFrom(rawQuery) ?? 0;
     const limit = limitFrom(rawQuery);
-    let merged = orderLiveCandidates(path, mergeLiveCandidates(candidates));
-    if (shouldComputeLiveTotal(rawQuery) && pageFetches.some((fetch) => fetch.fetched < fetch.total)) {
-      await fetchRemainingLiveQueryCandidates(client, cacheVersion, userName, path, request, pageFetches, candidates);
-      merged = orderLiveCandidates(path, mergeLiveCandidates(candidates));
-    }
+    const merged = orderLiveCandidates(path, mergeLiveCandidates(candidates));
     const paged = limit === undefined ? merged.slice(startIndex) : merged.slice(startIndex, startIndex + limit);
-    const total = shouldComputeLiveTotal(rawQuery) ? merged.length : Math.max(merged.length, upstreamTotalRecordCount);
+    const total = Math.max(merged.length, upstreamTotalRecordCount);
     return queryResult(paged.map((candidate) => scopedLiveDto(candidate, userIdValue, bridgeServerIdValue)), startIndex, total);
-  }
-
-  async function fetchRemainingLiveQueryCandidates(
-    client: AppUpstreamClient,
-    cacheVersion: number,
-    userName: string,
-    path: string,
-    request: FastifyRequest | undefined,
-    pageFetches: LivePageFetch[],
-    candidates: LiveCandidate[]
-  ): Promise<void> {
-    for (const pageFetch of pageFetches) {
-      let startIndex = pageFetch.fetched;
-      while (startIndex < pageFetch.total) {
-        const query = livePageQuery(pageFetch.query, startIndex, Math.min(100, pageFetch.total - startIndex));
-        logUpstreamJson(request, path, pageFetch.source, path);
-        const response = await client.json<unknown>(pageFetch.source.serverId, path, { query });
-        const items = liveItemsFromResponse(response);
-        if (items.length === 0) break;
-        for (const item of items) {
-          if (pageFetch.source.libraryId) {
-            await ensureRelatedLiveItems(client, cacheVersion, userName, pageFetch.source, item);
-            upsertLiveItem(pageFetch.source, item);
-          }
-          candidates.push({ source: pageFetch.source, item });
-        }
-        startIndex += items.length;
-      }
-    }
   }
 
   async function getLiveItem(userName: string, itemIdValue: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown> | undefined> {
@@ -1200,15 +1158,6 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       query.Limit = startIndex + limit;
     }
     return query;
-  }
-
-  function livePageQuery(query: LiveQueryParams, startIndex: number, limit: number): LiveQueryParams {
-    const pageQuery = { ...query };
-    delete pageQuery.startIndex;
-    delete pageQuery.limit;
-    pageQuery.StartIndex = startIndex;
-    pageQuery.Limit = limit;
-    return pageQuery;
   }
 
   async function liveUserId(client: AppUpstreamClient, cacheVersion: number, serverIdValue: string, userName: string): Promise<string | undefined> {
@@ -3147,12 +3096,6 @@ function limitFrom(query: unknown): number | undefined {
 function datePlayedFromQuery(query: unknown): string | undefined {
   const value = (query ?? {}) as Record<string, string | undefined>;
   return value.DatePlayed ?? value.datePlayed;
-}
-
-function shouldComputeLiveTotal(query: unknown): boolean {
-  const value = (query ?? {}) as Record<string, string | boolean | undefined>;
-  const raw = value.EnableTotalRecordCount ?? value.enableTotalRecordCount;
-  return raw !== false && raw !== "false";
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

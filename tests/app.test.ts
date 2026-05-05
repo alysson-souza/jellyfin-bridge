@@ -2932,7 +2932,7 @@ test("aggregates and proxies home, artwork, detail, and playback routes without 
   });
   assert.equal(resume.statusCode, 200);
   assert.deepEqual(resume.json().Items.map((item: any) => item.Id), [bridgeItemId("movie:tmdb:300"), bridgeItemId("movie:tmdb:400")]);
-  assert.equal(resume.json().TotalRecordCount, 2);
+  assert.equal(resume.json().TotalRecordCount, 4);
   assert.equal((upstream.requests.find((request) => request.serverId === "primary" && request.path === "/UserItems/Resume")?.init as any).query.UserId, "primary-user");
   assert.equal((upstream.requests.find((request) => request.serverId === "primary" && request.path === "/UserItems/Resume")?.init as any).query.ParentId, "primary-movies");
 
@@ -3566,16 +3566,78 @@ test("pages live next-up after merging upstream results", async () => {
     .filter((request) => request.path === "/Shows/NextUp")
     .map((request) => request.init.query), [
     { StartIndex: 0, Limit: 56, UserId: "primary-user" },
-    { StartIndex: 0, Limit: 56, UserId: "secondary-user" },
-    { StartIndex: 56, Limit: 44, UserId: "primary-user" },
-    { StartIndex: 56, Limit: 44, UserId: "secondary-user" }
+    { StartIndex: 0, Limit: 56, UserId: "secondary-user" }
   ]);
 
   await app.close();
   store.close();
 });
 
-test("does not overcount duplicate upstream rows in live next-up totals", async () => {
+test("does not exhaust live resume pages to compute totals", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "primary", name: "Primary", url: "https://primary.example.com", token: "token" },
+      { id: "secondary", name: "Secondary", url: "https://secondary.example.com", token: "token" }
+    ],
+    libraries: []
+  };
+  const allItems = {
+    primary: Array.from({ length: 100 }, (_, index) => ({
+      Id: `primary-${index}`,
+      Type: "Movie",
+      Name: `Primary ${index}`,
+      ProviderIds: { Tmdb: `p-${index}` },
+      UserData: { PlaybackPositionTicks: 100, LastPlayedDate: `2026-01-${String(28 - (index % 28)).padStart(2, "0")}T00:00:00.000Z` }
+    })),
+    secondary: Array.from({ length: 100 }, (_, index) => ({
+      Id: `secondary-${index}`,
+      Type: "Movie",
+      Name: `Secondary ${index}`,
+      ProviderIds: { Tmdb: `s-${index}` },
+      UserData: { PlaybackPositionTicks: 100, LastPlayedDate: `2026-01-${String(28 - (index % 28)).padStart(2, "0")}T00:00:00.000Z` }
+    }))
+  };
+  const upstream = {
+    requests: [] as Array<{ serverId: string; path: string; init: any }>,
+    async json<T>(serverId: string, path: string, init: any): Promise<T> {
+      this.requests.push({ serverId, path, init });
+      if (path === "/Users") return [{ Id: `${serverId}-user`, Name: "alice" }] as T;
+      if (path !== "/UserItems/Resume") throw new Error(`Unexpected upstream request ${serverId}:${path}`);
+      const query = init.query as Record<string, string | number | undefined>;
+      const start = Number(query.StartIndex ?? query.startIndex ?? 0);
+      const limit = Number(query.Limit ?? query.limit ?? allItems[serverId as keyof typeof allItems].length);
+      const items = allItems[serverId as keyof typeof allItems].slice(start, start + limit);
+      return { Items: items, TotalRecordCount: allItems[serverId as keyof typeof allItems].length, StartIndex: start } as T;
+    }
+  };
+  const store = new Store(":memory:");
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const resume = await app.inject({
+    method: "GET",
+    url: `/UserItems/Resume?userId=${login.json().User.Id}&startIndex=50&limit=6`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(resume.statusCode, 200);
+  assert.equal(resume.json().Items.length, 6);
+  assert.equal(resume.json().TotalRecordCount, 200);
+  assert.deepEqual(upstream.requests
+    .filter((request) => request.path === "/UserItems/Resume")
+    .map((request) => request.init.query), [
+    { StartIndex: 0, Limit: 56, UserId: "primary-user" },
+    { StartIndex: 0, Limit: 56, UserId: "secondary-user" }
+  ]);
+
+  await app.close();
+  store.close();
+});
+
+test("deduplicates fetched live next-up rows without extra total fetches", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
     server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
@@ -3612,13 +3674,13 @@ test("does not overcount duplicate upstream rows in live next-up totals", async 
 
   assert.equal(nextUp.statusCode, 200);
   assert.equal(nextUp.json().Items.length, 1);
-  assert.equal(nextUp.json().TotalRecordCount, 1);
+  assert.equal(nextUp.json().TotalRecordCount, 2);
 
   await app.close();
   store.close();
 });
 
-test("counts duplicate live next-up rows beyond the fetched page", async () => {
+test("does not chase duplicate live next-up rows beyond the fetched page", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
     server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
@@ -3668,7 +3730,7 @@ test("counts duplicate live next-up rows beyond the fetched page", async () => {
 
   assert.equal(nextUp.statusCode, 200);
   assert.equal(nextUp.json().Items.length, 6);
-  assert.equal(nextUp.json().TotalRecordCount, 100);
+  assert.equal(nextUp.json().TotalRecordCount, 200);
   assert.deepEqual(nextUp.json().Items.map((item: any) => item.Name), [
     "Primary 50",
     "Primary 51",
@@ -3677,12 +3739,18 @@ test("counts duplicate live next-up rows beyond the fetched page", async () => {
     "Primary 54",
     "Primary 55"
   ]);
+  assert.deepEqual(upstream.requests
+    .filter((request) => request.path === "/Shows/NextUp")
+    .map((request) => request.init.query), [
+    { StartIndex: 0, Limit: 56, UserId: "primary-user" },
+    { StartIndex: 0, Limit: 56, UserId: "secondary-user" }
+  ]);
 
   await app.close();
   store.close();
 });
 
-test("counts duplicate live next-up rows that begin after the requested page", async () => {
+test("does not chase duplicate live next-up rows that begin after the requested page", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
     server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
@@ -3732,7 +3800,13 @@ test("counts duplicate live next-up rows that begin after the requested page", a
 
   assert.equal(nextUp.statusCode, 200);
   assert.equal(nextUp.json().Items.length, 20);
-  assert.equal(nextUp.json().TotalRecordCount, 150);
+  assert.equal(nextUp.json().TotalRecordCount, 200);
+  assert.deepEqual(upstream.requests
+    .filter((request) => request.path === "/Shows/NextUp")
+    .map((request) => request.init.query), [
+    { StartIndex: 0, Limit: 20, UserId: "primary-user" },
+    { StartIndex: 0, Limit: 20, UserId: "secondary-user" }
+  ]);
 
   await app.close();
   store.close();
