@@ -1,7 +1,7 @@
 import type { BridgeConfig } from "./config.js";
 import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId, passThroughLibraryId } from "./ids.js";
 import { ITEM_ID_FIELDS, rewriteDto } from "./rewriter.js";
-import type { IndexedItemRecord, Store } from "./store.js";
+import type { IndexedItemParentRef, IndexedItemRecord, Store } from "./store.js";
 
 export interface BrowseQuery {
   includeItemTypes?: string;
@@ -118,6 +118,18 @@ export function getBridgeItem(config: BridgeConfig, store: Store, userId: string
 
 export function bridgeItemSources(config: BridgeConfig, store: Store, itemId: string): IndexedItemRecord[] {
   return sortSourcesByPriority(config, store.findIndexedItemsByBridgeId(itemId));
+}
+
+export function listBridgeItemsForSourceParents(
+  config: BridgeConfig,
+  store: Store,
+  userId: string,
+  parentSources: IndexedItemParentRef[],
+  itemTypes: string[] = []
+): Record<string, unknown>[] {
+  return groupByLogicalKey(store.listIndexedChildItems(parentSources, itemTypes))
+    .map((sources) => toBridgeItem(config, store, userId, sources))
+    .sort(compareItems({}));
 }
 
 export function bridgeItemIdMapForSourceItem(

@@ -29,6 +29,12 @@ export interface IndexedItemRecord {
   json: Record<string, unknown>;
 }
 
+export interface IndexedItemParentRef {
+  serverId: string;
+  libraryId: string;
+  itemId: string;
+}
+
 export interface MediaSourceMapping {
   bridgeMediaSourceId: string;
   serverId: string;
@@ -260,6 +266,32 @@ export class Store {
     }));
   }
 
+  listIndexedChildItems(parentSources: IndexedItemParentRef[], itemTypes: string[] = []): IndexedItemRecord[] {
+    if (parentSources.length === 0) return [];
+    const typeClause = itemTypes.length === 0 ? "" : ` AND item_type IN (${itemTypes.map(() => "?").join(", ")})`;
+    const subqueries: string[] = [];
+    const values: string[] = [];
+    for (const source of parentSources) {
+      for (const field of ["ParentId", "SeriesId", "SeasonId"]) {
+        subqueries.push(`
+          SELECT * FROM indexed_items
+          WHERE server_id = ? AND library_id = ?${typeClause} AND json_extract(json, '$.${field}') = ?
+        `);
+        values.push(source.serverId, source.libraryId, ...itemTypes, source.itemId);
+      }
+    }
+    const rows = this.db.prepare(`
+      ${subqueries.join(" UNION ALL ")}
+    `).all(...values) as Row[];
+    const uniqueRows = new Map<string, Row>();
+    for (const row of rows) {
+      uniqueRows.set(`${String(row.server_id)}:${String(row.item_id)}`, row);
+    }
+    return Array.from(uniqueRows.values())
+      .map(indexedItemFromRow)
+      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
+  }
+
   findIndexedItemsByBridgeId(bridgeItemId: string): IndexedItemRecord[] {
     const rows = this.db.prepare("SELECT * FROM indexed_items WHERE bridge_item_id = ? ORDER BY server_id, library_id, item_id").all(bridgeItemId) as Row[];
     return rows
@@ -448,6 +480,10 @@ export class Store {
 
       CREATE INDEX IF NOT EXISTS idx_indexed_items_logical_key ON indexed_items(logical_key);
       CREATE INDEX IF NOT EXISTS idx_indexed_items_library ON indexed_items(server_id, library_id);
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_library_type ON indexed_items(server_id, library_id, item_type);
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_parent_id ON indexed_items(server_id, library_id, item_type, json_extract(json, '$.ParentId'));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_series_id ON indexed_items(server_id, library_id, item_type, json_extract(json, '$.SeriesId'));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_season_id ON indexed_items(server_id, library_id, item_type, json_extract(json, '$.SeasonId'));
       CREATE INDEX IF NOT EXISTS idx_indexed_items_item_id ON indexed_items(item_id);
 
       CREATE TABLE IF NOT EXISTS media_source_mappings (

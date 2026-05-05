@@ -62,3 +62,18 @@ test("uses an index for upstream item id lookups", () => {
     store.close();
   }
 });
+
+test("uses indexes for indexed item parent lookups", () => {
+  const store = new Store(":memory:");
+  try {
+    const plan = store.db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT * FROM indexed_items
+      WHERE server_id = ? AND library_id = ? AND item_type = ? AND json_extract(json, '$.SeriesId') = ?
+    `).all("main", "shows", "Season", "series-a") as Array<{ detail: string }>;
+
+    assert.match(plan.map((step) => step.detail).join("\n"), /idx_indexed_items_series_id/);
+  } finally {
+    store.close();
+  }
+});

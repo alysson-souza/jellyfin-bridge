@@ -3331,6 +3331,76 @@ test("indexes live latest related TV items before returning bridge ids", async (
   store.close();
 });
 
+test("cached show season and episode routes use targeted indexed children", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "shows-lib",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "series-a", Type: "Series", Name: "Example Series", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-a",
+    libraryId: "shows-lib",
+    itemType: "Season",
+    logicalKey: "season:series:series-a:season:1",
+    json: { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "episode-a",
+    libraryId: "shows-lib",
+    itemType: "Episode",
+    logicalKey: "episode:series:series-a:season:1:episode:1",
+    json: { Id: "episode-a", Type: "Episode", Name: "Episode 1", SeriesId: "series-a", SeasonId: "season-a", ParentIndexNumber: 1, IndexNumber: 1 }
+  });
+  for (let index = 0; index < 25; index += 1) {
+    store.upsertIndexedItem({
+      serverId: "main",
+      itemId: `unrelated-${index}`,
+      libraryId: "shows-lib",
+      itemType: "Episode",
+      logicalKey: `source:main:unrelated-${index}`,
+      json: { Id: `unrelated-${index}`, Type: "Episode", Name: `Unrelated ${index}`, SeriesId: "other-series", ParentIndexNumber: 1, IndexNumber: index + 1 }
+    });
+  }
+  store.listIndexedItems = () => {
+    throw new Error("full catalog scan");
+  };
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const seriesId = bridgeItemId("series:tvdb:100");
+
+  const seasons = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Seasons?userId=${login.json().User.Id}&limit=200`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(seasons.statusCode, 200);
+  assert.deepEqual(seasons.json().Items.map((item: any) => item.Name), ["Season 1"]);
+
+  const episodes = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Episodes?userId=${login.json().User.Id}&SeasonId=${seasons.json().Items[0].Id}&limit=200`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(episodes.statusCode, 200);
+  assert.deepEqual(episodes.json().Items.map((item: any) => item.Name), ["Episode 1"]);
+
+  await app.close();
+  store.close();
+});
+
 test("indexes parent-scoped live next-up items before returning bridge ids", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {

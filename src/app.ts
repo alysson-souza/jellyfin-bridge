@@ -6,7 +6,7 @@ import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId, pas
 import { rewriteHlsPlaylist } from "./hls.js";
 import { Indexer } from "./indexer.js";
 import { libraryDto, passThroughLibraryDto, publicSystemInfo, queryResult, sessionInfo, systemInfo, userDataDto } from "./jellyfin.js";
-import { bridgeItemIdMapForSourceItem, bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, queryBridgeItems } from "./library.js";
+import { bridgeItemIdMapForSourceItem, bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, listBridgeItemsForSourceParents, queryBridgeItems } from "./library.js";
 import type { BrowseQuery } from "./library.js";
 import { logicalItemKey, type SourceItem } from "./merge.js";
 import { findMetadataItem, listAlbumArtists, listArtists, listGenres, listPersons, listStudios, listYears } from "./metadata.js";
@@ -428,16 +428,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       if (live) return live;
     }
     if (seriesSources.length === 0) return notFound(reply, "Series not found");
-    const upstreamSeriesIds = new Set(seriesSources.map((source) => source.itemId));
-    let seasons = listBridgeItems(snapshotConfig, store, auth.session.userId)
-      .filter((item) => String(item.Type).toLowerCase() === "season" && upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")));
+    let seasons = listBridgeItemsForSourceParents(snapshotConfig, store, auth.session.userId, seriesSources, ["Season"]);
     if (seasons.length === 0) {
       await refreshLiveSeasons(client, seriesSources, request.query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream seasons failed: ${detail}`);
       });
-      seasons = listBridgeItems(snapshotConfig, store, auth.session.userId)
-        .filter((item) => String(item.Type).toLowerCase() === "season" && upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")));
+      seasons = listBridgeItemsForSourceParents(snapshotConfig, store, auth.session.userId, seriesSources, ["Season"]);
     }
     return queryResult(seasons);
   });
@@ -456,23 +453,16 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       if (live) return live;
     }
     if (seriesSources.length === 0 && seasonSources.length === 0) return notFound(reply, "Series not found");
-    const upstreamSeriesIds = new Set(seriesSources.map((source) => source.itemId));
-    const upstreamSeasonIds = new Set(seasonSources.map((source) => source.itemId));
     const seasonNumber = query.Season ?? query.season;
-    let episodes = listBridgeItems(snapshotConfig, store, auth.session.userId)
-      .filter((item) => String(item.Type).toLowerCase() === "episode")
-      .filter((item) => upstreamSeriesIds.size === 0 || upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")))
-      .filter((item) => upstreamSeasonIds.size === 0 || upstreamSeasonIds.has(String(item.SeasonIdSource ?? item.SeasonId ?? "")))
+    const episodeParentSources = seasonSources.length > 0 ? seasonSources : seriesSources;
+    let episodes = listBridgeItemsForSourceParents(snapshotConfig, store, auth.session.userId, episodeParentSources, ["Episode"])
       .filter((item) => seasonNumber === undefined || String(item.ParentIndexNumber) === seasonNumber);
     if (episodes.length === 0) {
       await refreshLiveEpisodes(client, seriesSources, seasonSources, request.query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream episodes failed: ${detail}`);
       });
-      episodes = listBridgeItems(snapshotConfig, store, auth.session.userId)
-        .filter((item) => String(item.Type).toLowerCase() === "episode")
-        .filter((item) => upstreamSeriesIds.size === 0 || upstreamSeriesIds.has(String(item.SeriesIdSource ?? item.SeriesId ?? "")))
-        .filter((item) => upstreamSeasonIds.size === 0 || upstreamSeasonIds.has(String(item.SeasonIdSource ?? item.SeasonId ?? "")))
+      episodes = listBridgeItemsForSourceParents(snapshotConfig, store, auth.session.userId, episodeParentSources, ["Episode"])
         .filter((item) => seasonNumber === undefined || String(item.ParentIndexNumber) === seasonNumber);
     }
     return pagedQueryResult(episodes, browseQuery(request.query));
