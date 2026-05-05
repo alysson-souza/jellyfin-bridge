@@ -259,14 +259,14 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.get("/Items/Latest", async (request) => {
     const auth = requireSession(request, config, store);
     const snapshotConfig = config;
-    return await liveLatestItems(auth.user.name, request.query, request).catch(() => latestItems(snapshotConfig, auth.session.userId, request.query));
+    return await liveLatestItems(auth.user.name, auth.session.userId, request.query, request).catch(() => latestItems(snapshotConfig, auth.session.userId, request.query));
   });
   app.get("/Users/:userId/Items/Latest", async (request) => {
     const auth = requireSession(request, config, store);
     const params = request.params as { userId: string };
     const userIdValue = requireSelf(auth, params.userId);
     const snapshotConfig = config;
-    return await liveLatestItems(auth.user.name, request.query, request).catch(() => latestItems(snapshotConfig, userIdValue, request.query));
+    return await liveLatestItems(auth.user.name, userIdValue, request.query, request).catch(() => latestItems(snapshotConfig, userIdValue, request.query));
   });
   app.get("/UserItems/Resume", async (request) => {
     const auth = requireSession(request, config, store);
@@ -771,7 +771,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
   }
 
-  async function liveLatestItems(userName: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>[]> {
+  async function liveLatestItems(userName: string, userIdValue: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>[]> {
     if (!liveRouteAggregation) throw new Error("Live route aggregation is disabled");
     const client = upstream;
     const bridgeServerIdValue = serverId;
@@ -787,6 +787,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         const response = await client.json<unknown>(source.serverId, "/Items/Latest", { query });
         sawResponse = true;
         for (const item of liveItemsFromResponse(response)) {
+          upsertLiveItem(source, item);
           candidates.push({ source, item });
         }
       } catch (error) {
@@ -799,7 +800,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return mergeLiveCandidates(candidates)
       .sort(compareLiveDateCreatedDescending)
       .slice(0, limit)
-      .map(({ source, item }) => rewriteLiveDto(item, source, bridgeServerIdValue));
+      .map((candidate) => canonicalLiveDto(candidate, userIdValue, bridgeServerIdValue));
   }
 
   async function liveQueryResult(userName: string, path: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>> {
@@ -1015,6 +1016,15 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return isRecord(rewritten) ? rewritten : item;
   }
 
+  function canonicalLiveDto(candidate: LiveCandidate, userIdValue: string, bridgeServerIdValue: string): Record<string, unknown> {
+    if (candidate.source.libraryId) {
+      const id = bridgeItemId(logicalItemKey(candidate.item as unknown as SourceItem, candidate.source.serverId));
+      const item = getBridgeItem(config, store, userIdValue, id);
+      if (item) return item;
+    }
+    return rewriteLiveDto(candidate.item, candidate.source, bridgeServerIdValue);
+  }
+
   function rewriteLiveValue(value: unknown, source: LiveSource, bridgeServerIdValue: string): unknown {
     if (Array.isArray(value)) return value.map((item) => rewriteLiveValue(item, source, bridgeServerIdValue));
     if (!isRecord(value)) return value;
@@ -1103,15 +1113,20 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   function upsertLiveItems(serverIdValue: string, libraryIdValue: string, items: SourceItem[]): void {
     for (const item of items) {
-      store.upsertIndexedItem({
-        serverId: serverIdValue,
-        itemId: item.Id,
-        libraryId: libraryIdValue,
-        itemType: item.Type ?? "Unknown",
-        logicalKey: logicalItemKey(item, serverIdValue),
-        json: item as unknown as Record<string, unknown>
-      });
+      upsertLiveItem({ serverId: serverIdValue, libraryId: libraryIdValue, priority: 0 }, item as unknown as Record<string, unknown>);
     }
+  }
+
+  function upsertLiveItem(source: LiveSource, item: Record<string, unknown>): void {
+    if (!source.libraryId || typeof item.Id !== "string") return;
+    store.upsertIndexedItem({
+      serverId: source.serverId,
+      itemId: item.Id,
+      libraryId: source.libraryId,
+      itemType: typeof item.Type === "string" ? item.Type : "Unknown",
+      logicalKey: logicalItemKey(item as unknown as SourceItem, source.serverId),
+      json: item
+    });
   }
 
   async function refreshLiveViewsForRequest(snapshotConfig: BridgeConfig, client: AppUpstreamClient, query: unknown): Promise<void> {

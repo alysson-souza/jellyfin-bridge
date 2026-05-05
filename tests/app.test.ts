@@ -2194,8 +2194,8 @@ test("aggregates and proxies home, artwork, detail, and playback routes without 
   });
   assert.equal(latest.statusCode, 200);
   assert.deepEqual(latest.json().map((item: any) => [item.Id, item.Name]), [
-    ["movie-b", "Secondary Movie"],
-    ["movie-a", "Primary Movie"]
+    [bridgeItemId("movie:tmdb:200"), "Secondary Movie"],
+    [bridgeItemId("movie:tmdb:100"), "Primary Movie"]
   ]);
   assert.equal((upstream.requests.find((request) => request.serverId === "primary" && request.path === "/Items/Latest")?.init as any).query.ParentId, "primary-movies");
   assert.equal((upstream.requests.find((request) => request.serverId === "secondary" && request.path === "/Items/Latest")?.init as any).query.ParentId, "secondary-movies");
@@ -2269,6 +2269,55 @@ test("aggregates and proxies home, artwork, detail, and playback routes without 
   assert.equal(progress.statusCode, 204);
   assert.equal(upstream.requests.at(-1)?.path, "/Sessions/Playing/Progress");
   assert.equal((upstream.requests.at(-1)?.init as any).body.ItemId, "movie-a");
+
+  await app.close();
+  store.close();
+});
+
+test("returns bridge item ids from live latest media so TV seasons resolve", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/Items/Latest": [
+      { Id: "series-a", Type: "Series", Name: "Latest Series", ProviderIds: { Tvdb: "100" }, DateCreated: "2026-01-01T00:00:00.000Z" }
+    ],
+    "main:/Shows/series-a/Seasons": {
+      Items: [{ Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }],
+      TotalRecordCount: 1,
+      StartIndex: 0
+    }
+  });
+  const store = new Store(":memory:");
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const latest = await app.inject({
+    method: "GET",
+    url: `/Items/Latest?userId=${login.json().User.Id}&parentId=${bridgeLibraryId("shows")}&limit=20`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(latest.statusCode, 200);
+  const seriesId = latest.json()[0].Id;
+  assert.equal(seriesId, bridgeItemId("series:tvdb:100"));
+
+  const seasons = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Seasons`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(seasons.statusCode, 200);
+  assert.deepEqual(seasons.json().Items.map((item: any) => item.Name), ["Season 1"]);
+  assert.deepEqual(upstream.requests.map((request) => `${request.serverId}:${request.path}`), [
+    "main:/Users",
+    "main:/Items/Latest",
+    "main:/Shows/series-a/Seasons"
+  ]);
 
   await app.close();
   store.close();
