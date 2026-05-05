@@ -2323,6 +2323,45 @@ test("returns bridge item ids from live latest media so TV seasons resolve", asy
   store.close();
 });
 
+test("narrows live latest TV libraries to episodes like Jellyfin user views", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const upstream = {
+    requests: [] as Array<{ serverId: string; path: string; init: any }>,
+    async json<T>(serverId: string, path: string, init: any): Promise<T> {
+      this.requests.push({ serverId, path, init });
+      if (path === "/Users") return [{ Id: "main-user", Name: "alice" }] as T;
+      if (path === "/Items/Latest") {
+        return ((init.query.IncludeItemTypes ?? init.query.includeItemTypes) === "Episode"
+          ? [{ Id: "episode-a", Type: "Episode", Name: "Latest Episode", SeriesId: "series-a", ParentIndexNumber: 1, IndexNumber: 1, DateCreated: "2026-01-02T00:00:00.000Z" }]
+          : [{ Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1, DateCreated: "2026-01-03T00:00:00.000Z" }]) as T;
+      }
+      throw new Error(`Unexpected upstream request ${serverId}:${path}`);
+    }
+  };
+  const store = new Store(":memory:");
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const latest = await app.inject({
+    method: "GET",
+    url: `/Items/Latest?userId=${login.json().User.Id}&parentId=${bridgeLibraryId("shows")}&startIndex=0&limit=20`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(latest.statusCode, 200);
+  assert.deepEqual(latest.json().map((item: any) => [item.Type, item.Name]), [["Episode", "Latest Episode"]]);
+  assert.equal(upstream.requests.find((request) => request.path === "/Items/Latest")?.init.query.IncludeItemTypes, "Episode");
+
+  await app.close();
+  store.close();
+});
+
 test("serves latest media from online sources when another source is unavailable", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {

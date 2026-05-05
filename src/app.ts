@@ -31,6 +31,7 @@ interface LiveSource {
   serverId: string;
   libraryId?: string;
   bridgeLibraryId?: string;
+  collectionType?: string | null;
   priority: number;
 }
 
@@ -782,7 +783,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     let sawResponse = false;
     await Promise.all(sources.map(async (source) => {
       try {
-        const query = await liveQueryForSource(client, cacheVersion, userName, rawQuery, source);
+        const query = latestLiveQueryForSource(rawQuery, source, await liveQueryForSource(client, cacheVersion, userName, rawQuery, source));
         logUpstreamJson(request, "/Items/Latest", source, "/Items/Latest");
         const response = await client.json<unknown>(source.serverId, "/Items/Latest", { query });
         sawResponse = true;
@@ -864,6 +865,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
           serverId: source.server,
           libraryId: source.libraryId,
           bridgeLibraryId: bridgeLibraryId(library.id),
+          collectionType: library.collectionType,
           priority: liveSourcePriority(source.server, index)
         }));
       }
@@ -875,6 +877,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
           serverId: passThroughLibrary.serverId,
           libraryId: passThroughLibrary.libraryId,
           bridgeLibraryId: parentId,
+          collectionType: passThroughLibrary.collectionType,
           priority: liveSourcePriority(passThroughLibrary.serverId, 0)
         }];
       }
@@ -888,6 +891,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
           serverId: source.server,
           libraryId: source.libraryId,
           bridgeLibraryId: bridgeLibraryId(library.id),
+          collectionType: library.collectionType,
           priority: liveSourcePriority(source.server, index)
         });
       }
@@ -951,6 +955,19 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const upstreamUserId = await liveUserId(client, cacheVersion, source.serverId, userName);
     if (upstreamUserId) {
       query.UserId = upstreamUserId;
+    }
+    return query;
+  }
+
+  function latestLiveQueryForSource(
+    rawQuery: unknown,
+    source: LiveSource,
+    query: Record<string, string | number | boolean | undefined>
+  ): Record<string, string | number | boolean | undefined> {
+    const includeItemTypes = latestIncludeItemTypesForCollection(source.collectionType);
+    if (includeItemTypes && !includeItemTypesFrom(rawQuery)) {
+      delete query.includeItemTypes;
+      query.IncludeItemTypes = includeItemTypes;
     }
     return query;
   }
@@ -2058,6 +2075,18 @@ function safeImageIndexPathSegment(value: string): string | undefined {
 function parentIdFrom(query: unknown): string | undefined {
   const value = (query ?? {}) as Record<string, string | undefined>;
   return value.ParentId ?? value.parentId;
+}
+
+function includeItemTypesFrom(query: unknown): string | undefined {
+  const value = (query ?? {}) as Record<string, string | undefined>;
+  const includeItemTypes = value.IncludeItemTypes ?? value.includeItemTypes;
+  return includeItemTypes && includeItemTypes.length > 0 ? includeItemTypes : undefined;
+}
+
+function latestIncludeItemTypesForCollection(collectionType: string | null | undefined): string | undefined {
+  if (collectionType === "movies") return "Movie";
+  if (collectionType === "tvshows") return "Episode";
+  return undefined;
 }
 
 function startIndexFrom(query: unknown): number | undefined {
