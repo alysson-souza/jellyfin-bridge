@@ -3151,6 +3151,65 @@ test("narrows live latest TV libraries to episodes like Jellyfin user views", as
   store.close();
 });
 
+test("excludes live latest TV specials before applying the shelf limit", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/Items/Latest": (_serverId: string, _path: string, init: any) =>
+      (init.query.IncludeItemTypes === "Episode"
+        ? [
+            {
+              Id: "special-a",
+              Type: "Episode",
+              Name: "Special Episode",
+              ParentId: "season-specials",
+              SeriesId: "series-a",
+              SeasonId: "season-specials",
+              ParentIndexNumber: 0,
+              IndexNumber: 1,
+              DateCreated: "2026-01-03T00:00:00.000Z"
+            },
+            {
+              Id: "episode-a",
+              Type: "Episode",
+              Name: "Regular Episode",
+              ParentId: "season-a",
+              SeriesId: "series-a",
+              SeasonId: "season-a",
+              ParentIndexNumber: 1,
+              IndexNumber: 1,
+              DateCreated: "2026-01-02T00:00:00.000Z"
+            }
+          ]
+        : []) as unknown[],
+    "main:/Items/series-a": { Id: "series-a", Type: "Series", Name: "Example Series", ProviderIds: { Tvdb: "100" } },
+    "main:/Items/season-specials": { Id: "season-specials", Type: "Season", Name: "Specials", SeriesId: "series-a", IndexNumber: 0 },
+    "main:/Items/season-a": { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }
+  });
+  const store = new Store(":memory:");
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const latest = await app.inject({
+    method: "GET",
+    url: `/Items/Latest?userId=${login.json().User.Id}&ParentId=${bridgeLibraryId("shows")}&Limit=1`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(latest.statusCode, 200);
+  assert.deepEqual(latest.json().map((item: any) => item.Name), ["Regular Episode"]);
+  assert.equal((upstream.requests.find((request) => request.path === "/Items/Latest")?.init as any).query.IncludeItemTypes, "Episode");
+
+  await app.close();
+  store.close();
+});
+
 test("groups multiple live latest episodes by series like Jellyfin", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
@@ -3852,6 +3911,67 @@ test("cached latest fallback applies Jellyfin collection defaults", async () => 
 
   assert.equal(latest.statusCode, 200);
   assert.deepEqual(latest.json().map((item: any) => [item.Name, item.Type]), [["Episode 1", "Episode"]]);
+
+  await app.close();
+  store.close();
+});
+
+test("cached latest fallback excludes specials before applying the shelf limit", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-specials",
+    libraryId: "shows-lib",
+    itemType: "Season",
+    logicalKey: "season:series:series-a:season:0",
+    json: { Id: "season-specials", Type: "Season", Name: "Specials", SeriesId: "series-a", IndexNumber: 0 }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-a",
+    libraryId: "shows-lib",
+    itemType: "Season",
+    logicalKey: "season:series:series-a:season:1",
+    json: { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "special-a",
+    libraryId: "shows-lib",
+    itemType: "Episode",
+    logicalKey: "episode:series:series-a:season:0:episode:1",
+    json: { Id: "special-a", Type: "Episode", Name: "Special Episode", SeriesId: "series-a", SeasonId: "season-specials", IndexNumber: 1, DateCreated: "2026-01-03T00:00:00.000Z" }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "episode-a",
+    libraryId: "shows-lib",
+    itemType: "Episode",
+    logicalKey: "episode:series:series-a:season:1:episode:1",
+    json: { Id: "episode-a", Type: "Episode", Name: "Regular Episode", SeriesId: "series-a", SeasonId: "season-a", ParentIndexNumber: 1, IndexNumber: 1, DateCreated: "2026-01-02T00:00:00.000Z" }
+  });
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/Items/Latest": new Error("Upstream main request failed for /Items/Latest: offline")
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const latest = await app.inject({
+    method: "GET",
+    url: `/Items/Latest?userId=${login.json().User.Id}&ParentId=${bridgeLibraryId("shows")}&Limit=1`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(latest.statusCode, 200);
+  assert.deepEqual(latest.json().map((item: any) => item.Name), ["Regular Episode"]);
 
   await app.close();
   store.close();

@@ -1117,7 +1117,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   function groupLatestDtos(items: Record<string, unknown>[], userIdValue: string, snapshotConfig: BridgeConfig = config): Record<string, unknown>[] {
     const output: Record<string, unknown>[] = [];
     const episodeGroups = new Map<string, { container: Record<string, unknown>; children: Record<string, unknown>[]; index: number }>();
-    for (const item of items) {
+    for (const item of items.filter((item) => !isLatestSpecial(item, userIdValue, snapshotConfig))) {
       const seriesId = String(item.Type ?? "").toLowerCase() === "episode" && typeof item.SeriesId === "string" ? item.SeriesId : undefined;
       const series = seriesId ? getBridgeItem(snapshotConfig, store, userIdValue, seriesId) : undefined;
       if (!seriesId || !series) {
@@ -1140,6 +1140,21 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       }
     }
     return output;
+  }
+
+  function isLatestSpecial(item: Record<string, unknown>, userIdValue: string, snapshotConfig: BridgeConfig): boolean {
+    const type = String(item.Type ?? "").toLowerCase();
+    if (type === "season") return isZeroIndex(item.IndexNumber);
+    if (type !== "episode") return false;
+    if (isZeroIndex(item.ParentIndexNumber)) return true;
+    if (item.ParentIndexNumber !== undefined && item.ParentIndexNumber !== null) return false;
+    if (typeof item.SeasonId !== "string") return false;
+    const season = getBridgeItem(snapshotConfig, store, userIdValue, item.SeasonId);
+    return season ? isZeroIndex(season.IndexNumber) : false;
+  }
+
+  function isZeroIndex(value: unknown): boolean {
+    return value === 0 || value === "0";
   }
 
   function scopedLiveDto(candidate: LiveCandidate, userIdValue: string, bridgeServerIdValue: string): Record<string, unknown> {
