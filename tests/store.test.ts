@@ -51,3 +51,14 @@ test("migrates indexed items from the legacy schema without bridge item ids", ()
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("uses an index for upstream item id lookups", () => {
+  const store = new Store(":memory:");
+  try {
+    const plan = store.db.prepare("EXPLAIN QUERY PLAN SELECT * FROM indexed_items WHERE item_id = ?").all("movie-a") as Array<{ detail: string }>;
+
+    assert.match(plan.map((step) => step.detail).join("\n"), /idx_indexed_items_item_id/);
+  } finally {
+    store.close();
+  }
+});

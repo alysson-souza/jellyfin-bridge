@@ -448,6 +448,7 @@ export class Store {
 
       CREATE INDEX IF NOT EXISTS idx_indexed_items_logical_key ON indexed_items(logical_key);
       CREATE INDEX IF NOT EXISTS idx_indexed_items_library ON indexed_items(server_id, library_id);
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_item_id ON indexed_items(item_id);
 
       CREATE TABLE IF NOT EXISTS media_source_mappings (
         bridge_media_source_id TEXT PRIMARY KEY,
@@ -492,7 +493,7 @@ export class Store {
       );
     `);
 	    this.ensureColumn("indexed_items", "bridge_item_id", "TEXT");
-	    this.ensureColumn("user_item_data", "last_played_date", "TEXT");
+    this.ensureColumn("user_item_data", "last_played_date", "TEXT");
     this.backfillBridgeItemIds();
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_indexed_items_bridge_item_id ON indexed_items(bridge_item_id)");
   }
