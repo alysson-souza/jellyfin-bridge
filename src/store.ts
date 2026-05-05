@@ -69,7 +69,10 @@ export class Store {
 
   constructor(path = "jellyfin-bridge.db") {
     this.db = new Database(path);
-    this.db.exec("PRAGMA foreign_keys = ON");
+    this.db.exec(`
+      PRAGMA foreign_keys = ON;
+      PRAGMA temp_store = MEMORY;
+    `);
     this.migrate();
   }
 

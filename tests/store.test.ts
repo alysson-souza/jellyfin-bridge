@@ -7,6 +7,15 @@ import Database from "better-sqlite3";
 import { bridgeItemId } from "../src/ids.js";
 import { Store } from "../src/store.js";
 
+test("uses in-memory SQLite temp storage for scratch containers", () => {
+  const store = new Store(":memory:");
+  try {
+    assert.equal(store.db.pragma("temp_store", { simple: true }), 2);
+  } finally {
+    store.close();
+  }
+});
+
 test("migrates indexed items from the legacy schema without bridge item ids", () => {
   const dir = mkdtempSync(join(tmpdir(), "jellyfin-bridge-store-"));
   const path = join(dir, "store.db");
