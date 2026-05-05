@@ -17,6 +17,7 @@ export interface UserDataPatch {
   isFavorite?: boolean;
   playbackPositionTicks?: number;
   playCount?: number;
+  lastPlayedDate?: string | null;
 }
 
 export interface IndexedItemRecord {
@@ -115,14 +116,15 @@ export class Store {
     const now = new Date().toISOString();
     this.db.prepare(`
       INSERT INTO user_item_data (
-        user_id, item_id, played, is_favorite, playback_position_ticks, play_count, updated_at
+        user_id, item_id, played, is_favorite, playback_position_ticks, play_count, last_played_date, updated_at
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, item_id) DO UPDATE SET
         played = COALESCE(excluded.played, user_item_data.played),
         is_favorite = COALESCE(excluded.is_favorite, user_item_data.is_favorite),
         playback_position_ticks = COALESCE(excluded.playback_position_ticks, user_item_data.playback_position_ticks),
         play_count = COALESCE(excluded.play_count, user_item_data.play_count),
+        last_played_date = COALESCE(excluded.last_played_date, user_item_data.last_played_date),
         updated_at = excluded.updated_at
     `).run(
       userId,
@@ -131,8 +133,12 @@ export class Store {
       patch.isFavorite === undefined ? null : Number(patch.isFavorite),
       patch.playbackPositionTicks ?? null,
       patch.playCount ?? null,
+      patch.lastPlayedDate ?? null,
       now
     );
+    if (patch.lastPlayedDate === null) {
+      this.db.prepare("UPDATE user_item_data SET last_played_date = NULL, updated_at = ? WHERE user_id = ? AND item_id = ?").run(now, userId, itemId);
+    }
   }
 
   getUserData(userId: string, itemId: string): Record<string, unknown> {
@@ -142,6 +148,7 @@ export class Store {
       PlayCount: Number(row?.play_count ?? 0),
       IsFavorite: Boolean(row?.is_favorite ?? 0),
       Played: Boolean(row?.played ?? 0),
+      LastPlayedDate: row?.last_played_date === null || row?.last_played_date === undefined ? null : String(row.last_played_date),
       Key: itemId
     };
   }
@@ -464,10 +471,11 @@ export class Store {
         played INTEGER,
         is_favorite INTEGER,
         playback_position_ticks INTEGER,
-        play_count INTEGER,
-        updated_at TEXT NOT NULL,
-        PRIMARY KEY (user_id, item_id)
-      );
+	        play_count INTEGER,
+	        last_played_date TEXT,
+	        updated_at TEXT NOT NULL,
+	        PRIMARY KEY (user_id, item_id)
+	      );
 
       CREATE TABLE IF NOT EXISTS scan_state (
         scope TEXT PRIMARY KEY,
@@ -483,7 +491,8 @@ export class Store {
         updated_at TEXT NOT NULL
       );
     `);
-    this.ensureColumn("indexed_items", "bridge_item_id", "TEXT");
+	    this.ensureColumn("indexed_items", "bridge_item_id", "TEXT");
+	    this.ensureColumn("user_item_data", "last_played_date", "TEXT");
     this.backfillBridgeItemIds();
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_indexed_items_bridge_item_id ON indexed_items(bridge_item_id)");
   }

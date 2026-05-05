@@ -60,3 +60,50 @@ test("uses logical item map when upstream items are merged", () => {
   assert.equal(rewritten.Id, logicalId);
   assert.equal(rewritten.ParentId, "library-id");
 });
+
+test("can preserve unmapped related ids while rewriting known item ids", () => {
+  const logicalId = bridgeItemId("episode:tvdb:123");
+  const rewritten = rewriteDto(
+    {
+      Id: "remote-episode",
+      SeriesId: "remote-series",
+      ParentArtItemId: "remote-art",
+      ParentPrimaryImageItemId: "remote-primary"
+    },
+    {
+      serverId: "remote",
+      bridgeServerId: "bridge-server",
+      itemIdMap: new Map([["remote-episode", logicalId]]),
+      rewriteUnknownItemIds: false
+    }
+  ) as Record<string, unknown>;
+
+  assert.equal(rewritten.Id, logicalId);
+  assert.equal(rewritten.SeriesId, "remote-series");
+  assert.equal(rewritten.ParentArtItemId, "remote-art");
+  assert.equal(rewritten.ParentPrimaryImageItemId, "remote-primary");
+});
+
+test("rewrites trickplay keys from source media source mappings when media sources are absent", () => {
+  const itemId = bridgeItemId("movie:tmdb:123");
+  const mediaSourceId = "bridge-source";
+  const rewritten = rewriteDto(
+    {
+      Id: "upstream-item",
+      Trickplay: {
+        "source-1": {
+          "320": { Width: 320 }
+        }
+      }
+    },
+    {
+      serverId: "main",
+      bridgeServerId: "bridge-server",
+      itemIdMap: new Map([["upstream-item", itemId]]),
+      mediaSourceIdMap: new Map([["source-1", mediaSourceId]]),
+      rewriteUnknownItemIds: false
+    }
+  ) as Record<string, any>;
+
+  assert.deepEqual(Object.keys(rewritten.Trickplay), [mediaSourceId]);
+});
