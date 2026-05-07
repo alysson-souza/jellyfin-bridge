@@ -1,4 +1,5 @@
 import Database from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import { bridgeItemId as makeBridgeItemId, newToken } from "./ids.js";
 
 export interface SessionRecord {
@@ -18,6 +19,17 @@ export interface UserDataPatch {
   playbackPositionTicks?: number;
   playCount?: number;
   lastPlayedDate?: string | null;
+}
+
+export interface UserDataRecord {
+  userId: string;
+  itemId: string;
+  playbackPositionTicks: number;
+  playCount: number;
+  isFavorite: boolean;
+  played: boolean;
+  lastPlayedDate: string | null;
+  updatedAt: string;
 }
 
 export interface IndexedItemRecord {
@@ -68,6 +80,16 @@ export interface ScanStateRecord {
 export interface ScanCursorRecord {
   scope: string;
   cursorAt: string;
+  updatedAt: string;
+}
+
+export interface InfuseSyncCheckpointRecord {
+  id: string;
+  deviceId: string;
+  userId: string;
+  fromTimestamp: string;
+  syncTimestamp: string | null;
+  createdAt: string;
   updatedAt: string;
 }
 
@@ -157,6 +179,25 @@ export class Store {
       LastPlayedDate: row?.last_played_date === null || row?.last_played_date === undefined ? null : String(row.last_played_date),
       Key: itemId
     };
+  }
+
+  listUserDataUpdatedBetween(userId: string, fromTimestamp: string, toTimestamp: string, itemTypes: string[] = []): UserDataRecord[] {
+    const normalizedTypes = itemTypes.map((type) => type.toLowerCase());
+    const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(indexed_items.item_type) IN (${normalizedTypes.map(() => "?").join(", ")})`;
+    const rows = normalizedTypes.length === 0
+      ? this.db.prepare(`
+        SELECT * FROM user_item_data
+        WHERE user_id = ? AND updated_at BETWEEN ? AND ?
+        ORDER BY item_id
+      `).all(userId, fromTimestamp, toTimestamp) as Row[]
+      : this.db.prepare(`
+        SELECT DISTINCT user_item_data.*
+        FROM user_item_data
+        JOIN indexed_items ON indexed_items.bridge_item_id = user_item_data.item_id
+        WHERE user_item_data.user_id = ? AND user_item_data.updated_at BETWEEN ? AND ?${typeClause}
+        ORDER BY user_item_data.item_id
+      `).all(userId, fromTimestamp, toTimestamp, ...normalizedTypes) as Row[];
+    return rows.map(userDataFromRow);
   }
 
   upsertIndexedItem(item: IndexedItemRecord): void {
@@ -249,6 +290,17 @@ export class Store {
       logicalKey: String(row.logical_key),
       json: JSON.parse(String(row.json)) as Record<string, unknown>
     }));
+  }
+
+  listIndexedItemsUpdatedBetween(fromTimestamp: string, toTimestamp: string): IndexedItemRecord[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM indexed_items
+      WHERE updated_at BETWEEN ? AND ?
+      ORDER BY updated_at, server_id, library_id, item_id
+    `).all(fromTimestamp, toTimestamp) as Row[];
+    return rows
+      .map(indexedItemFromRow)
+      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
   }
 
   listIndexedItemsForSources(sources: Array<{ serverId: string; libraryId: string }>): IndexedItemRecord[] {
@@ -443,6 +495,63 @@ export class Store {
     };
   }
 
+  createInfuseSyncCheckpoint(deviceId: string, userId: string): InfuseSyncCheckpointRecord {
+    const now = new Date().toISOString();
+    const previous = this.db.prepare(`
+      SELECT sync_timestamp FROM infuse_sync_checkpoints
+      WHERE device_id = ? AND user_id = ? AND sync_timestamp IS NOT NULL
+      ORDER BY sync_timestamp DESC
+      LIMIT 1
+    `).get(deviceId, userId) as Row | undefined;
+    const checkpoint: InfuseSyncCheckpointRecord = {
+      id: randomUUID(),
+      deviceId,
+      userId,
+      fromTimestamp: previous?.sync_timestamp === null || previous?.sync_timestamp === undefined ? now : String(previous.sync_timestamp),
+      syncTimestamp: null,
+      createdAt: now,
+      updatedAt: now
+    };
+
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM infuse_sync_checkpoints WHERE device_id = ? AND user_id = ?").run(deviceId, userId);
+      this.db.prepare(`
+        INSERT INTO infuse_sync_checkpoints (id, device_id, user_id, from_timestamp, sync_timestamp, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        checkpoint.id,
+        checkpoint.deviceId,
+        checkpoint.userId,
+        checkpoint.fromTimestamp,
+        checkpoint.syncTimestamp,
+        checkpoint.createdAt,
+        checkpoint.updatedAt
+      );
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+
+    return checkpoint;
+  }
+
+  getInfuseSyncCheckpoint(id: string): InfuseSyncCheckpointRecord | undefined {
+    const row = this.db.prepare("SELECT * FROM infuse_sync_checkpoints WHERE id = ?").get(id) as Row | undefined;
+    return row ? infuseSyncCheckpointFromRow(row) : undefined;
+  }
+
+  startInfuseSyncCheckpoint(id: string): InfuseSyncCheckpointRecord | undefined {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(`
+      UPDATE infuse_sync_checkpoints
+      SET sync_timestamp = ?, updated_at = ?
+      WHERE id = ?
+    `).run(now, now, id);
+    return result.changes === 0 ? undefined : this.getInfuseSyncCheckpoint(id);
+  }
+
   private migrate(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
@@ -514,6 +623,20 @@ export class Store {
 	        PRIMARY KEY (user_id, item_id)
 	      );
 
+      CREATE INDEX IF NOT EXISTS idx_user_item_data_user_updated_at ON user_item_data(user_id, updated_at);
+
+      CREATE TABLE IF NOT EXISTS infuse_sync_checkpoints (
+        id TEXT PRIMARY KEY,
+        device_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        from_timestamp TEXT NOT NULL,
+        sync_timestamp TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_infuse_sync_checkpoints_device_user ON infuse_sync_checkpoints(device_id, user_id);
+
       CREATE TABLE IF NOT EXISTS scan_state (
         scope TEXT PRIMARY KEY,
         status TEXT NOT NULL,
@@ -532,6 +655,7 @@ export class Store {
     this.ensureColumn("user_item_data", "last_played_date", "TEXT");
     this.backfillBridgeItemIds();
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_indexed_items_bridge_item_id ON indexed_items(bridge_item_id)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_indexed_items_updated_at ON indexed_items(updated_at)");
   }
 
   private ensureColumn(table: string, column: string, definition: string): void {
@@ -582,5 +706,30 @@ function indexedItemFromRow(row: Row): IndexedItemRecord & { bridgeItemId: strin
     logicalKey,
     bridgeItemId: makeBridgeItemId(logicalKey),
     json: JSON.parse(String(row.json)) as Record<string, unknown>
+  };
+}
+
+function userDataFromRow(row: Row): UserDataRecord {
+  return {
+    userId: String(row.user_id),
+    itemId: String(row.item_id),
+    playbackPositionTicks: Number(row.playback_position_ticks ?? 0),
+    playCount: Number(row.play_count ?? 0),
+    isFavorite: Boolean(row.is_favorite ?? 0),
+    played: Boolean(row.played ?? 0),
+    lastPlayedDate: row.last_played_date === null ? null : String(row.last_played_date),
+    updatedAt: String(row.updated_at)
+  };
+}
+
+function infuseSyncCheckpointFromRow(row: Row): InfuseSyncCheckpointRecord {
+  return {
+    id: String(row.id),
+    deviceId: String(row.device_id),
+    userId: String(row.user_id),
+    fromTimestamp: String(row.from_timestamp),
+    syncTimestamp: row.sync_timestamp === null ? null : String(row.sync_timestamp),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at)
   };
 }

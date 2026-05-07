@@ -6,12 +6,12 @@ import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId, pas
 import { rewriteHlsPlaylist } from "./hls.js";
 import { Indexer } from "./indexer.js";
 import { libraryDto, passThroughLibraryDto, publicSystemInfo, queryResult, sessionInfo, systemInfo, userDataDto } from "./jellyfin.js";
-import { bridgeItemIdMapForSourceItem, bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, listBridgeItemsForSourceParents, queryBridgeItems } from "./library.js";
+import { bridgeItemIdMapForSourceItem, bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, listBridgeItemsForSourceParents, queryBridgeItems, queryBridgeItemsFromIndexedItems } from "./library.js";
 import type { BrowseQuery } from "./library.js";
 import { logicalItemKey, type SourceItem } from "./merge.js";
 import { findMetadataItem, listAlbumArtists, listArtists, listGenres, listPersons, listStudios, listYears } from "./metadata.js";
 import { ITEM_ID_FIELDS, rewriteDto } from "./rewriter.js";
-import type { IndexedItemRecord, MediaSourceMapping, PlaybackSessionMapping, Store, UserDataPatch } from "./store.js";
+import type { IndexedItemRecord, InfuseSyncCheckpointRecord, MediaSourceMapping, PlaybackSessionMapping, Store, UserDataPatch, UserDataRecord } from "./store.js";
 import { UpstreamClient } from "./upstream.js";
 
 interface AppUpstreamClient {
@@ -226,6 +226,76 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   app.get("/Library/VirtualFolders", async (request) => {
     requireSession(request, config, store);
+    return virtualFolders();
+  });
+
+  app.get("/Plugins", async (request) => {
+    requireSession(request, config, store);
+    return [infuseSyncPluginInfo()];
+  });
+
+  app.post("/InfuseSync/Checkpoint", async (request) => {
+    const auth = requireSession(request, config, store);
+    const deviceIdValue = requiredInfuseSyncQueryValue(request.query, "DeviceID");
+    const userIdValue = requireSelf(auth, requiredInfuseSyncQueryValue(request.query, "UserID"));
+    const checkpoint = store.createInfuseSyncCheckpoint(deviceIdValue, userIdValue);
+    return { Id: checkpoint.id };
+  });
+
+  app.post("/InfuseSync/Checkpoint/:checkpointId/StartSync", async (request, reply) => {
+    const auth = requireSession(request, config, store);
+    const { checkpointId } = request.params as { checkpointId: string };
+    const checkpoint = store.getInfuseSyncCheckpoint(checkpointId);
+    if (!checkpoint) return notFound(reply, "InfuseSync checkpoint not found");
+    requireSelf(auth, checkpoint.userId);
+    const synced = store.startInfuseSyncCheckpoint(checkpointId);
+    if (!synced) return notFound(reply, "InfuseSync checkpoint not found");
+    return infuseSyncStats(requireCompletedInfuseSyncCheckpoint(synced));
+  });
+
+  app.get("/InfuseSync/Checkpoint/:checkpointId/UpdatedItems", async (request, reply) => {
+    const auth = requireSession(request, config, store);
+    const checkpoint = infuseSyncCheckpointFromRequest(request, reply);
+    if (!checkpoint) return;
+    requireSelf(auth, checkpoint.userId);
+    const syncWindow = requireCompletedInfuseSyncCheckpoint(checkpoint);
+    const query = infuseSyncBrowseQuery(request.query);
+    const result = queryBridgeItemsFromIndexedItems(
+      config,
+      store,
+      auth.session.userId,
+      store.listIndexedItemsUpdatedBetween(syncWindow.fromTimestamp, syncWindow.syncTimestamp),
+      query
+    );
+    return queryResult(result.items, query.startIndex ?? 0, result.total);
+  });
+
+  app.get("/InfuseSync/Checkpoint/:checkpointId/RemovedItems", async (request, reply) => {
+    const auth = requireSession(request, config, store);
+    const checkpoint = infuseSyncCheckpointFromRequest(request, reply);
+    if (!checkpoint) return;
+    requireSelf(auth, checkpoint.userId);
+    requireCompletedInfuseSyncCheckpoint(checkpoint);
+    return queryResult([], infuseSyncStartIndex(request.query), 0);
+  });
+
+  app.get("/InfuseSync/Checkpoint/:checkpointId/UserData", async (request, reply) => {
+    const auth = requireSession(request, config, store);
+    const checkpoint = infuseSyncCheckpointFromRequest(request, reply);
+    if (!checkpoint) return;
+    requireSelf(auth, checkpoint.userId);
+    const syncWindow = requireCompletedInfuseSyncCheckpoint(checkpoint);
+    const query = infuseSyncBrowseQuery(request.query);
+    const rows = store.listUserDataUpdatedBetween(checkpoint.userId, syncWindow.fromTimestamp, syncWindow.syncTimestamp, parseInfuseSyncItemTypes(request.query));
+    const start = query.startIndex ?? 0;
+    const end = query.limit === undefined ? undefined : start + query.limit;
+    return queryResult(rows.slice(start, end).map(infuseSyncUserDataDto), start, rows.length);
+  });
+
+  app.get("/InfuseSync/UserFolders/:userId", async (request) => {
+    const auth = requireSession(request, config, store);
+    const { userId: requestedUserId } = request.params as { userId: string };
+    requireSelf(auth, requestedUserId);
     return virtualFolders();
   });
 
@@ -1852,6 +1922,39 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       .filter((folder) => typeof folder.Name === "string" && typeof folder.ItemId === "string");
   }
 
+  function infuseSyncCheckpointFromRequest(request: FastifyRequest, reply: FastifyReply): InfuseSyncCheckpointRecord | undefined {
+    const { checkpointId } = request.params as { checkpointId: string };
+    const checkpoint = store.getInfuseSyncCheckpoint(checkpointId);
+    if (!checkpoint) {
+      notFound(reply, "InfuseSync checkpoint not found");
+      return undefined;
+    }
+    return checkpoint;
+  }
+
+  function infuseSyncStats(checkpoint: InfuseSyncCheckpointRecord & { syncTimestamp: string }): Record<string, number> {
+    const changedItems = store.listIndexedItemsUpdatedBetween(checkpoint.fromTimestamp, checkpoint.syncTimestamp);
+    const videoItemTypes = "Movie,Episode,Video,MusicVideo";
+    const updatedCount = (includeItemTypes: string): number =>
+      queryBridgeItemsFromIndexedItems(config, store, checkpoint.userId, changedItems, { includeItemTypes }).total;
+    return {
+      UpdatedFolders: updatedCount("Folder"),
+      RemovedFolders: 0,
+      UpdatedBoxSets: updatedCount("BoxSet"),
+      RemovedBoxSets: 0,
+      UpdatedPlaylists: updatedCount("Playlist"),
+      RemovedPlaylists: 0,
+      UpdatedTvShows: updatedCount("Series"),
+      RemovedTvShows: 0,
+      UpdatedSeasons: updatedCount("Season"),
+      RemovedSeasons: 0,
+      UpdatedVideos: updatedCount(videoItemTypes),
+      RemovedVideos: 0,
+      UpdatedCollectionFolders: updatedCount("CollectionFolder"),
+      UpdatedUserData: store.listUserDataUpdatedBetween(checkpoint.userId, checkpoint.fromTimestamp, checkpoint.syncTimestamp, includeItemTypeList(videoItemTypes)).length
+    };
+  }
+
   function displayPreferencesDto(id: string, client: string): Record<string, unknown> {
     return {
       Id: id,
@@ -2895,9 +2998,75 @@ function userIdFromQuery(query: unknown): string | undefined {
   return typeof raw === "string" ? raw : undefined;
 }
 
+function infuseSyncPluginInfo(): Record<string, unknown> {
+  return {
+    Name: "InfuseSync",
+    Description: "Plugin for fast synchronization with Infuse.",
+    Id: "022a3003-993f-45f1-8565-87d12af2e12a",
+    Version: "1.5.2.0",
+    CanUninstall: false,
+    HasImage: false,
+    Status: "Active"
+  };
+}
+
+function requiredInfuseSyncQueryValue(query: unknown, name: string): string {
+  const value = caseInsensitiveQueryValue(query, name);
+  if (!value) throw badRequestError(`${name} is required`);
+  return value;
+}
+
+function caseInsensitiveQueryValue(query: unknown, name: string): string | undefined {
+  const expected = name.toLowerCase();
+  for (const [key, value] of Object.entries((query ?? {}) as Record<string, unknown>)) {
+    if (key.toLowerCase() !== expected) continue;
+    const raw = Array.isArray(value) ? value[0] : value;
+    return typeof raw === "string" && raw.length > 0 ? raw : undefined;
+  }
+  return undefined;
+}
+
+function infuseSyncBrowseQuery(query: unknown): BrowseQuery {
+  return {
+    includeItemTypes: includeItemTypesFrom(query),
+    startIndex: startIndexFrom(query),
+    limit: limitFrom(query)
+  };
+}
+
+function infuseSyncStartIndex(query: unknown): number {
+  return startIndexFrom(query) ?? 0;
+}
+
+function parseInfuseSyncItemTypes(query: unknown): string[] {
+  return includeItemTypeList(includeItemTypesFrom(query));
+}
+
+function requireCompletedInfuseSyncCheckpoint(checkpoint: InfuseSyncCheckpointRecord): InfuseSyncCheckpointRecord & { syncTimestamp: string } {
+  if (!checkpoint.syncTimestamp) throw badRequestError("InfuseSync checkpoint has not started");
+  return checkpoint as InfuseSyncCheckpointRecord & { syncTimestamp: string };
+}
+
+function infuseSyncUserDataDto(record: UserDataRecord): Record<string, unknown> {
+  return {
+    PlaybackPositionTicks: record.playbackPositionTicks,
+    PlayCount: record.playCount,
+    IsFavorite: record.isFavorite,
+    LastPlayedDate: record.lastPlayedDate,
+    Played: record.played,
+    Key: record.itemId,
+    ItemId: record.itemId
+  };
+}
+
+function badRequestError(message: string): Error & { statusCode: number } {
+  return Object.assign(new Error(message), { statusCode: 400 });
+}
+
 function registerUnsupportedRoutes(app: FastifyInstance): void {
+  app.all("/Plugins/*", async (_request, reply) => unsupported(reply, "Plugins is not supported by Jellyfin Bridge"));
+
   for (const prefix of [
-    "Plugins",
     "Packages",
     "LiveTv",
     "SyncPlay",

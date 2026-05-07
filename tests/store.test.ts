@@ -52,6 +52,31 @@ test("migrates indexed items from the legacy schema without bridge item ids", ()
   }
 });
 
+test("replaces InfuseSync checkpoints with the previous sync timestamp as the next from timestamp", () => {
+  const store = new Store(":memory:");
+  try {
+    const first = store.createInfuseSyncCheckpoint("device-1", "user-1");
+
+    assert.equal(first.deviceId, "device-1");
+    assert.equal(first.userId, "user-1");
+    assert.equal(first.fromTimestamp, first.createdAt);
+    assert.equal(first.syncTimestamp, null);
+
+    const synced = store.startInfuseSyncCheckpoint(first.id);
+    assert.ok(synced?.syncTimestamp);
+
+    const second = store.createInfuseSyncCheckpoint("device-1", "user-1");
+
+    assert.notEqual(second.id, first.id);
+    assert.equal(second.fromTimestamp, synced.syncTimestamp);
+    assert.equal(second.syncTimestamp, null);
+    assert.equal(store.getInfuseSyncCheckpoint(first.id), undefined);
+    assert.deepEqual(store.getInfuseSyncCheckpoint(second.id), second);
+  } finally {
+    store.close();
+  }
+});
+
 test("uses an index for upstream item id lookups", () => {
   const store = new Store(":memory:");
   try {

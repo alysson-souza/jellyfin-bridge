@@ -34,6 +34,26 @@ export function listBridgeItems(config: BridgeConfig, store: Store, userId: stri
 }
 
 export function queryBridgeItems(config: BridgeConfig, store: Store, userId: string, query: BrowseQuery = {}): BridgeItemsResult {
+  return queryBridgeItemGroups(config, store, userId, groupByLogicalKey(indexedItemsForParent(config, store, query.parentId, query.recursive)), query);
+}
+
+export function queryBridgeItemsFromIndexedItems(
+  config: BridgeConfig,
+  store: Store,
+  userId: string,
+  indexedItems: IndexedItemRecord[],
+  query: BrowseQuery = {}
+): BridgeItemsResult {
+  return queryBridgeItemGroups(config, store, userId, completeSourceGroups(store, indexedItems), query);
+}
+
+function queryBridgeItemGroups(
+  config: BridgeConfig,
+  store: Store,
+  userId: string,
+  sourceGroups: IndexedItemRecord[][],
+  query: BrowseQuery
+): BridgeItemsResult {
   const includeTypes = parseList(query.includeItemTypes).map((type) => type.toLowerCase());
   const mediaTypes = parseList(query.mediaTypes).map((type) => type.toLowerCase());
   const genres = parseFilterList(query.genres).map((genre) => genre.toLowerCase());
@@ -44,7 +64,7 @@ export function queryBridgeItems(config: BridgeConfig, store: Store, userId: str
   const officialRatings = parseFilterList(query.officialRatings).map((rating) => rating.toLowerCase());
   const filters = new Set(parseList(query.filters).map((filter) => filter.toLowerCase()));
   const person = query.person?.toLowerCase();
-  const groups = groupByLogicalKey(indexedItemsForParent(config, store, query.parentId, query.recursive))
+  const groups = sourceGroups
     .map((sources) => toBridgeItem(config, store, userId, sources))
     .filter((item) => includeTypes.length === 0 || includeTypes.includes(String(item.Type ?? "").toLowerCase()))
     .filter((item) => mediaTypes.length === 0 || mediaTypes.includes(String(item.MediaType ?? "").toLowerCase()))
@@ -71,6 +91,17 @@ export function queryBridgeItems(config: BridgeConfig, store: Store, userId: str
     items: groups.slice(start, end),
     total: groups.length
   };
+}
+
+function completeSourceGroups(store: Store, items: IndexedItemRecord[]): IndexedItemRecord[][] {
+  const groups = new Map<string, IndexedItemRecord[]>();
+  for (const item of items) {
+    const bridgeId = bridgeItemId(item.logicalKey);
+    if (groups.has(bridgeId)) continue;
+    const sources = store.findIndexedItemsByBridgeId(bridgeId);
+    groups.set(bridgeId, sources.length > 0 ? sources : [item]);
+  }
+  return Array.from(groups.values());
 }
 
 function indexedItemsForParent(config: BridgeConfig, store: Store, parentId: string | undefined, recursive = false): IndexedItemRecord[] {
