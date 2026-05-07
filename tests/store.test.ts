@@ -102,3 +102,18 @@ test("uses indexes for indexed item parent lookups", () => {
     store.close();
   }
 });
+
+test("uses an index for case-insensitive source item type narrowing", () => {
+  const store = new Store(":memory:");
+  try {
+    const plan = store.db.prepare(`
+      EXPLAIN QUERY PLAN
+      SELECT * FROM indexed_items
+      WHERE server_id = ? AND library_id = ? AND lower(item_type) IN (?)
+    `).all("main", "movies", "movie") as Array<{ detail: string }>;
+
+    assert.match(plan.map((step) => step.detail).join("\n"), /lower_type/);
+  } finally {
+    store.close();
+  }
+});

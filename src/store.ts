@@ -171,32 +171,32 @@ export class Store {
 
   getUserData(userId: string, itemId: string): Record<string, unknown> {
     const row = this.db.prepare("SELECT * FROM user_item_data WHERE user_id = ? AND item_id = ?").get(userId, itemId) as Row | undefined;
-    return {
-      PlaybackPositionTicks: Number(row?.playback_position_ticks ?? 0),
-      PlayCount: Number(row?.play_count ?? 0),
-      IsFavorite: Boolean(row?.is_favorite ?? 0),
-      Played: Boolean(row?.played ?? 0),
-      LastPlayedDate: row?.last_played_date === null || row?.last_played_date === undefined ? null : String(row.last_played_date),
-      Key: itemId
-    };
+    return userDataDtoFromRow(row, itemId);
   }
 
-  listUserDataUpdatedBetween(userId: string, fromTimestamp: string, toTimestamp: string, itemTypes: string[] = []): UserDataRecord[] {
-    const normalizedTypes = itemTypes.map((type) => type.toLowerCase());
-    const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(indexed_items.item_type) IN (${normalizedTypes.map(() => "?").join(", ")})`;
-    const rows = normalizedTypes.length === 0
-      ? this.db.prepare(`
+  listUserData(userId: string, itemIds: string[]): Map<string, Record<string, unknown>> {
+    const ids = uniqueStrings(itemIds);
+    const data = new Map<string, Record<string, unknown>>();
+    for (const chunk of chunks(ids)) {
+      const placeholders = chunk.map(() => "?").join(", ");
+      const rows = this.db.prepare(`
         SELECT * FROM user_item_data
-        WHERE user_id = ? AND updated_at BETWEEN ? AND ?
-        ORDER BY item_id
-      `).all(userId, fromTimestamp, toTimestamp) as Row[]
-      : this.db.prepare(`
-        SELECT DISTINCT user_item_data.*
-        FROM user_item_data
-        JOIN indexed_items ON indexed_items.bridge_item_id = user_item_data.item_id
-        WHERE user_item_data.user_id = ? AND user_item_data.updated_at BETWEEN ? AND ?${typeClause}
-        ORDER BY user_item_data.item_id
-      `).all(userId, fromTimestamp, toTimestamp, ...normalizedTypes) as Row[];
+        WHERE user_id = ? AND item_id IN (${placeholders})
+      `).all(userId, ...chunk) as Row[];
+      for (const row of rows) {
+        const itemId = String(row.item_id);
+        data.set(itemId, userDataDtoFromRow(row, itemId));
+      }
+    }
+    return data;
+  }
+
+  listUserDataUpdatedBetween(userId: string, fromTimestamp: string, toTimestamp: string): UserDataRecord[] {
+    const rows = this.db.prepare(`
+      SELECT * FROM user_item_data
+      WHERE user_id = ? AND updated_at BETWEEN ? AND ?
+      ORDER BY item_id
+    `).all(userId, fromTimestamp, toTimestamp) as Row[];
     return rows.map(userDataFromRow);
   }
 
@@ -280,47 +280,47 @@ export class Store {
     this.db.prepare(`DELETE FROM indexed_items WHERE server_id = ? AND library_id = ? AND item_id NOT IN (${placeholders})`).run(serverId, libraryId, ...itemIds);
   }
 
-  listIndexedItems(): IndexedItemRecord[] {
-    const rows = this.db.prepare("SELECT * FROM indexed_items ORDER BY server_id, library_id, item_id").all() as Row[];
-    return rows.map((row) => ({
-      serverId: String(row.server_id),
-      itemId: String(row.item_id),
-      libraryId: String(row.library_id),
-      itemType: String(row.item_type),
-      logicalKey: String(row.logical_key),
-      json: JSON.parse(String(row.json)) as Record<string, unknown>
-    }));
+  listIndexedItems(itemTypes: string[] = []): IndexedItemRecord[] {
+    const normalizedTypes = normalizeItemTypes(itemTypes);
+    const rows = normalizedTypes.length === 0
+      ? this.db.prepare("SELECT * FROM indexed_items ORDER BY server_id, library_id, item_id").all() as Row[]
+      : this.db.prepare(`
+        SELECT * FROM indexed_items
+        WHERE lower(item_type) IN (${placeholders(normalizedTypes)})
+        ORDER BY server_id, library_id, item_id
+      `).all(...normalizedTypes) as Row[];
+    return rows.map(indexedItemRecordFromRow);
   }
 
-  listIndexedItemsUpdatedBetween(fromTimestamp: string, toTimestamp: string): IndexedItemRecord[] {
+  listIndexedItemsUpdatedBetween(fromTimestamp: string, toTimestamp: string, itemTypes: string[] = []): IndexedItemRecord[] {
+    const normalizedTypes = normalizeItemTypes(itemTypes);
+    const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(item_type) IN (${placeholders(normalizedTypes)})`;
     const rows = this.db.prepare(`
       SELECT * FROM indexed_items
-      WHERE updated_at BETWEEN ? AND ?
+      WHERE updated_at BETWEEN ? AND ?${typeClause}
       ORDER BY updated_at, server_id, library_id, item_id
-    `).all(fromTimestamp, toTimestamp) as Row[];
-    return rows
-      .map(indexedItemFromRow)
-      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
+    `).all(fromTimestamp, toTimestamp, ...normalizedTypes) as Row[];
+    return rows.map(indexedItemRecordFromRow);
   }
 
-  listIndexedItemsForSources(sources: Array<{ serverId: string; libraryId: string }>): IndexedItemRecord[] {
+  listIndexedItemsForSources(sources: Array<{ serverId: string; libraryId: string }>, itemTypes: string[] = []): IndexedItemRecord[] {
     if (sources.length === 0) return [];
     const conditions = sources.map(() => "(server_id = ? AND library_id = ?)").join(" OR ");
     const values = sources.flatMap((source) => [source.serverId, source.libraryId]);
-    const rows = this.db.prepare(`SELECT * FROM indexed_items WHERE ${conditions} ORDER BY server_id, library_id, item_id`).all(...values) as Row[];
-    return rows.map((row) => ({
-      serverId: String(row.server_id),
-      itemId: String(row.item_id),
-      libraryId: String(row.library_id),
-      itemType: String(row.item_type),
-      logicalKey: String(row.logical_key),
-      json: JSON.parse(String(row.json)) as Record<string, unknown>
-    }));
+    const normalizedTypes = normalizeItemTypes(itemTypes);
+    const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(item_type) IN (${placeholders(normalizedTypes)})`;
+    const rows = this.db.prepare(`
+      SELECT * FROM indexed_items
+      WHERE (${conditions})${typeClause}
+      ORDER BY server_id, library_id, item_id
+    `).all(...values, ...normalizedTypes) as Row[];
+    return rows.map(indexedItemRecordFromRow);
   }
 
   listIndexedChildItems(parentSources: IndexedItemParentRef[], itemTypes: string[] = []): IndexedItemRecord[] {
     if (parentSources.length === 0) return [];
-    const typeClause = itemTypes.length === 0 ? "" : ` AND item_type IN (${itemTypes.map(() => "?").join(", ")})`;
+    const normalizedTypes = normalizeItemTypes(itemTypes);
+    const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(item_type) IN (${placeholders(normalizedTypes)})`;
     const subqueries: string[] = [];
     const values: string[] = [];
     for (const source of parentSources) {
@@ -329,7 +329,7 @@ export class Store {
           SELECT * FROM indexed_items
           WHERE server_id = ? AND library_id = ?${typeClause} AND json_extract(json, '$.${field}') = ?
         `);
-        values.push(source.serverId, source.libraryId, ...itemTypes, source.itemId);
+        values.push(source.serverId, source.libraryId, ...normalizedTypes, source.itemId);
       }
     }
     const rows = this.db.prepare(`
@@ -339,23 +339,55 @@ export class Store {
     for (const row of rows) {
       uniqueRows.set(`${String(row.server_id)}:${String(row.item_id)}`, row);
     }
-    return Array.from(uniqueRows.values())
-      .map(indexedItemFromRow)
-      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
+    return Array.from(uniqueRows.values()).map(indexedItemRecordFromRow);
   }
 
   findIndexedItemsByBridgeId(bridgeItemId: string): IndexedItemRecord[] {
     const rows = this.db.prepare("SELECT * FROM indexed_items WHERE bridge_item_id = ? ORDER BY server_id, library_id, item_id").all(bridgeItemId) as Row[];
-    return rows
-      .map(indexedItemFromRow)
-      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
+    return rows.map(indexedItemRecordFromRow);
+  }
+
+  findIndexedItemsByBridgeIds(bridgeItemIds: string[]): Map<string, IndexedItemRecord[]> {
+    const ids = uniqueStrings(bridgeItemIds);
+    const byBridgeId = new Map<string, IndexedItemRecord[]>();
+    for (const chunk of chunks(ids)) {
+      const rows = this.db.prepare(`
+        SELECT * FROM indexed_items
+        WHERE bridge_item_id IN (${placeholders(chunk)})
+        ORDER BY server_id, library_id, item_id
+      `).all(...chunk) as Row[];
+      for (const row of rows) {
+        const key = String(row.bridge_item_id ?? makeBridgeItemId(String(row.logical_key)));
+        const items = byBridgeId.get(key) ?? [];
+        items.push(indexedItemRecordFromRow(row));
+        byBridgeId.set(key, items);
+      }
+    }
+    return byBridgeId;
   }
 
   findIndexedItemsBySourceId(itemId: string): IndexedItemRecord[] {
     const rows = this.db.prepare("SELECT * FROM indexed_items WHERE item_id = ? ORDER BY server_id, library_id, item_id").all(itemId) as Row[];
-    return rows
-      .map(indexedItemFromRow)
-      .map(({ bridgeItemId: _bridgeItemId, ...item }) => item);
+    return rows.map(indexedItemRecordFromRow);
+  }
+
+  findIndexedItemsBySourceIds(itemIds: string[]): Map<string, IndexedItemRecord[]> {
+    const ids = uniqueStrings(itemIds);
+    const bySourceId = new Map<string, IndexedItemRecord[]>();
+    for (const chunk of chunks(ids)) {
+      const rows = this.db.prepare(`
+        SELECT * FROM indexed_items
+        WHERE item_id IN (${placeholders(chunk)})
+        ORDER BY server_id, library_id, item_id
+      `).all(...chunk) as Row[];
+      for (const row of rows) {
+        const key = String(row.item_id);
+        const items = bySourceId.get(key) ?? [];
+        items.push(indexedItemRecordFromRow(row));
+        bySourceId.set(key, items);
+      }
+    }
+    return bySourceId;
   }
 
   removeIndexedItem(serverId: string, itemId: string): void {
@@ -590,9 +622,15 @@ export class Store {
       CREATE INDEX IF NOT EXISTS idx_indexed_items_logical_key ON indexed_items(logical_key);
       CREATE INDEX IF NOT EXISTS idx_indexed_items_library ON indexed_items(server_id, library_id);
       CREATE INDEX IF NOT EXISTS idx_indexed_items_library_type ON indexed_items(server_id, library_id, item_type);
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_lower_type ON indexed_items(lower(item_type));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_library_lower_type ON indexed_items(server_id, library_id, lower(item_type));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_lower_type_updated_at ON indexed_items(lower(item_type), updated_at);
       CREATE INDEX IF NOT EXISTS idx_indexed_items_parent_id ON indexed_items(server_id, library_id, item_type, json_extract(json, '$.ParentId'));
       CREATE INDEX IF NOT EXISTS idx_indexed_items_series_id ON indexed_items(server_id, library_id, item_type, json_extract(json, '$.SeriesId'));
       CREATE INDEX IF NOT EXISTS idx_indexed_items_season_id ON indexed_items(server_id, library_id, item_type, json_extract(json, '$.SeasonId'));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_parent_id_lower_type ON indexed_items(server_id, library_id, lower(item_type), json_extract(json, '$.ParentId'));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_series_id_lower_type ON indexed_items(server_id, library_id, lower(item_type), json_extract(json, '$.SeriesId'));
+      CREATE INDEX IF NOT EXISTS idx_indexed_items_season_id_lower_type ON indexed_items(server_id, library_id, lower(item_type), json_extract(json, '$.SeasonId'));
       CREATE INDEX IF NOT EXISTS idx_indexed_items_item_id ON indexed_items(item_id);
 
       CREATE TABLE IF NOT EXISTS media_source_mappings (
@@ -709,6 +747,22 @@ function indexedItemFromRow(row: Row): IndexedItemRecord & { bridgeItemId: strin
   };
 }
 
+function indexedItemRecordFromRow(row: Row): IndexedItemRecord {
+  const { bridgeItemId: _bridgeItemId, ...item } = indexedItemFromRow(row);
+  return item;
+}
+
+function userDataDtoFromRow(row: Row | undefined, itemId: string): Record<string, unknown> {
+  return {
+    PlaybackPositionTicks: Number(row?.playback_position_ticks ?? 0),
+    PlayCount: Number(row?.play_count ?? 0),
+    IsFavorite: Boolean(row?.is_favorite ?? 0),
+    Played: Boolean(row?.played ?? 0),
+    LastPlayedDate: row?.last_played_date === null || row?.last_played_date === undefined ? null : String(row.last_played_date),
+    Key: itemId
+  };
+}
+
 function userDataFromRow(row: Row): UserDataRecord {
   return {
     userId: String(row.user_id),
@@ -720,6 +774,26 @@ function userDataFromRow(row: Row): UserDataRecord {
     lastPlayedDate: row.last_played_date === null ? null : String(row.last_played_date),
     updatedAt: String(row.updated_at)
   };
+}
+
+function normalizeItemTypes(itemTypes: string[]): string[] {
+  return uniqueStrings(itemTypes.map((itemType) => itemType.trim().toLowerCase()).filter(Boolean));
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function placeholders(values: unknown[]): string {
+  return values.map(() => "?").join(", ");
+}
+
+function chunks<T>(values: T[], size = 900): T[][] {
+  const output: T[][] = [];
+  for (let index = 0; index < values.length; index += size) {
+    output.push(values.slice(index, index + size));
+  }
+  return output;
 }
 
 function infuseSyncCheckpointFromRow(row: Row): InfuseSyncCheckpointRecord {

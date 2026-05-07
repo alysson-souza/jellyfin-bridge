@@ -29,12 +29,18 @@ export interface BridgeItemsResult {
   total: number;
 }
 
+interface BridgeItemHydrationContext {
+  userDataByItemId: Map<string, Record<string, unknown>>;
+  indexedItemsBySourceId: Map<string, IndexedItemRecord[]>;
+}
+
 export function listBridgeItems(config: BridgeConfig, store: Store, userId: string, query: BrowseQuery = {}): Record<string, unknown>[] {
   return queryBridgeItems(config, store, userId, query).items;
 }
 
 export function queryBridgeItems(config: BridgeConfig, store: Store, userId: string, query: BrowseQuery = {}): BridgeItemsResult {
-  return queryBridgeItemGroups(config, store, userId, groupByLogicalKey(indexedItemsForParent(config, store, query.parentId, query.recursive)), query);
+  const includeTypes = parseList(query.includeItemTypes);
+  return queryBridgeItemGroups(config, store, userId, indexedItemGroupsForParent(config, store, query.parentId, query.recursive, includeTypes), query);
 }
 
 export function queryBridgeItemsFromIndexedItems(
@@ -45,6 +51,21 @@ export function queryBridgeItemsFromIndexedItems(
   query: BrowseQuery = {}
 ): BridgeItemsResult {
   return queryBridgeItemGroups(config, store, userId, completeSourceGroups(store, indexedItems), query);
+}
+
+export function countBridgeItemsFromIndexedItems(
+  config: BridgeConfig,
+  store: Store,
+  indexedItems: IndexedItemRecord[],
+  includeItemTypes: string
+): number {
+  const includeTypes = parseList(includeItemTypes).map((type) => type.toLowerCase());
+  return completeSourceGroups(store, indexedItems)
+    .filter((sources) => {
+      const selected = defaultSource(config, sources);
+      const type = String(selected.json.Type ?? selected.itemType ?? "").toLowerCase();
+      return includeTypes.length === 0 || includeTypes.includes(type);
+    }).length;
 }
 
 function queryBridgeItemGroups(
@@ -64,8 +85,9 @@ function queryBridgeItemGroups(
   const officialRatings = parseFilterList(query.officialRatings).map((rating) => rating.toLowerCase());
   const filters = new Set(parseList(query.filters).map((filter) => filter.toLowerCase()));
   const person = query.person?.toLowerCase();
+  const context = createHydrationContext(config, store, userId, sourceGroups);
   const groups = sourceGroups
-    .map((sources) => toBridgeItem(config, store, userId, sources))
+    .map((sources) => toBridgeItem(config, store, userId, sources, context))
     .filter((item) => includeTypes.length === 0 || includeTypes.includes(String(item.Type ?? "").toLowerCase()))
     .filter((item) => mediaTypes.length === 0 || mediaTypes.includes(String(item.MediaType ?? "").toLowerCase()))
     .filter((item) => query.isFavorite === undefined || Boolean((item.UserData as Record<string, unknown> | undefined)?.IsFavorite) === query.isFavorite)
@@ -93,44 +115,64 @@ function queryBridgeItemGroups(
   };
 }
 
-function completeSourceGroups(store: Store, items: IndexedItemRecord[]): IndexedItemRecord[][] {
-  const groups = new Map<string, IndexedItemRecord[]>();
+function completeSourceGroups(store: Store, items: IndexedItemRecord[], inScope: (item: IndexedItemRecord) => boolean = () => true): IndexedItemRecord[][] {
+  const fallbacks = new Map<string, IndexedItemRecord[]>();
   for (const item of items) {
     const bridgeId = bridgeItemId(item.logicalKey);
-    if (groups.has(bridgeId)) continue;
-    const sources = store.findIndexedItemsByBridgeId(bridgeId);
-    groups.set(bridgeId, sources.length > 0 ? sources : [item]);
+    if (fallbacks.has(bridgeId)) continue;
+    fallbacks.set(bridgeId, [item]);
   }
-  return Array.from(groups.values());
+  const completeSources = store.findIndexedItemsByBridgeIds(Array.from(fallbacks.keys()));
+  return Array.from(fallbacks.entries()).map(([bridgeId, fallback]) => {
+    const sources = (completeSources.get(bridgeId) ?? []).filter(inScope);
+    return sources && sources.length > 0 ? sources : fallback;
+  });
 }
 
-function indexedItemsForParent(config: BridgeConfig, store: Store, parentId: string | undefined, recursive = false): IndexedItemRecord[] {
-  if (!parentId) return store.listIndexedItems();
+function indexedItemGroupsForParent(config: BridgeConfig, store: Store, parentId: string | undefined, recursive = false, itemTypes: string[] = []): IndexedItemRecord[][] {
+  if (!parentId) return groupsFromCandidateItems(store, store.listIndexedItems(itemTypes), itemTypes);
   const configuredLibrary = config.libraries.find((library) => bridgeLibraryId(library.id) === parentId);
   if (configuredLibrary) {
     const sources = configuredLibrary.sources.map((source) => ({
       serverId: source.server,
       libraryId: source.libraryId
     }));
-    const items = store.listIndexedItemsForSources(sources);
-    return recursive ? items : directLibraryChildren(items, sources);
+    const items = store.listIndexedItemsForSources(sources, recursive ? itemTypes : []);
+    return groupsFromCandidateItems(store, recursive ? items : directLibraryChildren(items, sources), recursive ? itemTypes : [], sourceScope(sources));
   }
   const passThroughLibrary = store.listUpstreamLibraries().find((library) => passThroughLibraryId(library.serverId, library.libraryId) === parentId);
   if (passThroughLibrary) {
     const sources = [{ serverId: passThroughLibrary.serverId, libraryId: passThroughLibrary.libraryId }];
-    const items = store.listIndexedItemsForSources(sources);
-    return recursive ? items : directLibraryChildren(items, sources);
+    const items = store.listIndexedItemsForSources(sources, recursive ? itemTypes : []);
+    return groupsFromCandidateItems(store, recursive ? items : directLibraryChildren(items, sources), recursive ? itemTypes : [], sourceScope(sources));
   }
 
-  const items = store.listIndexedItems();
-  const parentSources = items.filter((item) => bridgeItemId(item.logicalKey) === parentId);
+  const parentSources = store.findIndexedItemsByBridgeId(parentId);
   if (parentSources.length === 0) return [];
-  const upstreamParents = new Set(parentSources.map((source) => `${source.serverId}:${source.itemId}`));
-  return items.filter((item) => {
+  return groupsFromCandidateItems(store, store.listIndexedChildItems(parentSources, itemTypes), itemTypes, childScope(parentSources));
+}
+
+function groupsFromCandidateItems(
+  store: Store,
+  items: IndexedItemRecord[],
+  itemTypes: string[] = [],
+  inScope?: (item: IndexedItemRecord) => boolean
+): IndexedItemRecord[][] {
+  return itemTypes.length === 0 ? groupByLogicalKey(items) : completeSourceGroups(store, items, inScope);
+}
+
+function sourceScope(sources: Array<{ serverId: string; libraryId: string }>): (item: IndexedItemRecord) => boolean {
+  const sourceKeys = new Set(sources.map((source) => `${source.serverId}:${source.libraryId}`));
+  return (item) => sourceKeys.has(`${item.serverId}:${item.libraryId}`);
+}
+
+function childScope(parentSources: IndexedItemParentRef[]): (item: IndexedItemRecord) => boolean {
+  const parentKeys = new Set(parentSources.map((source) => `${source.serverId}:${source.libraryId}:${source.itemId}`));
+  return (item) => {
     const parentCandidates = [item.json.ParentId, item.json.SeriesId, item.json.SeasonId]
       .filter((value): value is string => typeof value === "string");
-    return parentCandidates.some((candidate) => upstreamParents.has(`${item.serverId}:${candidate}`));
-  });
+    return parentCandidates.some((candidate) => parentKeys.has(`${item.serverId}:${item.libraryId}:${candidate}`));
+  };
 }
 
 function directLibraryChildren(items: IndexedItemRecord[], sources: Array<{ serverId: string; libraryId: string }>): IndexedItemRecord[] {
@@ -158,8 +200,12 @@ export function listBridgeItemsForSourceParents(
   parentSources: IndexedItemParentRef[],
   itemTypes: string[] = []
 ): Record<string, unknown>[] {
-  return groupByLogicalKey(store.listIndexedChildItems(parentSources, itemTypes))
-    .map((sources) => toBridgeItem(config, store, userId, sources))
+  const includeTypes = itemTypes.map((type) => type.trim().toLowerCase()).filter(Boolean);
+  const sourceGroups = groupsFromCandidateItems(store, store.listIndexedChildItems(parentSources, itemTypes), itemTypes, childScope(parentSources));
+  const context = createHydrationContext(config, store, userId, sourceGroups);
+  return sourceGroups
+    .map((sources) => toBridgeItem(config, store, userId, sources, context))
+    .filter((item) => includeTypes.length === 0 || includeTypes.includes(String(item.Type ?? "").toLowerCase()))
     .sort(compareItems({}));
 }
 
@@ -169,7 +215,8 @@ export function bridgeItemIdMapForSourceItem(
   serverId: string,
   sources: IndexedItemRecord[],
   bridgeId: string,
-  item: Record<string, unknown>
+  item: Record<string, unknown>,
+  context?: BridgeItemHydrationContext
 ): Map<string, string> {
   const itemIdMap = new Map(sources.map((source) => [source.itemId, bridgeId]));
   for (const source of sources) {
@@ -178,7 +225,10 @@ export function bridgeItemIdMapForSourceItem(
   for (const field of ITEM_ID_FIELDS) {
     const value = item[field];
     if (field !== "Id" && typeof value === "string") {
-      const related = store.findIndexedItemsBySourceId(value).find((candidate) => candidate.serverId === serverId);
+      const relatedSources = context
+        ? context.indexedItemsBySourceId.get(value) ?? []
+        : store.findIndexedItemsBySourceId(value);
+      const related = relatedSources.find((candidate) => candidate.serverId === serverId);
       if (related) itemIdMap.set(value, bridgeItemId(related.logicalKey));
     }
   }
@@ -222,10 +272,10 @@ export function itemCounts(store: Store): Record<string, number> {
   return counts;
 }
 
-function toBridgeItem(config: BridgeConfig, store: Store, userId: string, sources: IndexedItemRecord[]): Record<string, unknown> {
+function toBridgeItem(config: BridgeConfig, store: Store, userId: string, sources: IndexedItemRecord[], context?: BridgeItemHydrationContext): Record<string, unknown> {
   const selected = defaultSource(config, sources);
   const id = bridgeItemId(selected.logicalKey);
-  const itemIdMap = bridgeItemIdMapForSourceItem(config, store, selected.serverId, sources, id, selected.json);
+  const itemIdMap = bridgeItemIdMapForSourceItem(config, store, selected.serverId, sources, id, selected.json, context);
   const rewritten = rewriteDto(
     {
       ...selected.json,
@@ -248,11 +298,44 @@ function toBridgeItem(config: BridgeConfig, store: Store, userId: string, source
   if (typeof selected.json.SeasonId === "string") {
     rewritten.SeasonIdSource = selected.json.SeasonId;
   }
+  const userData = context
+    ? context.userDataByItemId.get(id) ?? defaultUserData(id)
+    : store.getUserData(userId, id);
   rewritten.UserData = {
-    ...store.getUserData(userId, id),
+    ...userData,
     ItemId: id
   };
   return rewritten;
+}
+
+function createHydrationContext(config: BridgeConfig, store: Store, userId: string, sourceGroups: IndexedItemRecord[][]): BridgeItemHydrationContext {
+  const bridgeIds = new Set<string>();
+  const relatedSourceIds = new Set<string>();
+  for (const sources of sourceGroups) {
+    const selected = defaultSource(config, sources);
+    bridgeIds.add(bridgeItemId(selected.logicalKey));
+    for (const field of ITEM_ID_FIELDS) {
+      const value = selected.json[field];
+      if (field !== "Id" && typeof value === "string") {
+        relatedSourceIds.add(value);
+      }
+    }
+  }
+  return {
+    userDataByItemId: store.listUserData(userId, Array.from(bridgeIds)),
+    indexedItemsBySourceId: store.findIndexedItemsBySourceIds(Array.from(relatedSourceIds))
+  };
+}
+
+function defaultUserData(itemId: string): Record<string, unknown> {
+  return {
+    PlaybackPositionTicks: 0,
+    PlayCount: 0,
+    IsFavorite: false,
+    Played: false,
+    LastPlayedDate: null,
+    Key: itemId
+  };
 }
 
 function bridgeMediaSourceIdMap(serverId: string, itemId: string, mediaSources: unknown): Map<string, string> {

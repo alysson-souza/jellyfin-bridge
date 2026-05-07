@@ -812,6 +812,12 @@ test("serves InfuseSync checkpoints from bridge-owned index and user data", asyn
     headers: { "X-MediaBrowser-Token": bobLogin.json().AccessToken }
   });
   assert.equal(crossUserStart.statusCode, 403);
+  const originalGetUserData = store.getUserData.bind(store);
+  let singleUserDataReads = 0;
+  store.getUserData = (userIdValue, itemIdValue) => {
+    singleUserDataReads += 1;
+    return originalGetUserData(userIdValue, itemIdValue);
+  };
 
   const startSync = await app.inject({
     method: "POST",
@@ -842,6 +848,7 @@ test("serves InfuseSync checkpoints from bridge-owned index and user data", asyn
   assert.equal(stats.UpdatedTvShows, 1);
   assert.equal(stats.UpdatedUserData, 1);
   assert.equal(stats.RemovedVideos, 0);
+  assert.equal(singleUserDataReads, 0);
 
   const folders = await app.inject({
     method: "GET",
@@ -900,6 +907,133 @@ test("serves InfuseSync checkpoints from bridge-owned index and user data", asyn
   });
   assert.equal(removedItems.statusCode, 200);
   assert.deepEqual(removedItems.json(), { Items: [], TotalRecordCount: 0, StartIndex: 2 });
+
+  await app.close();
+  store.close();
+});
+
+test("InfuseSync updated item type filtering uses the selected merged item type", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "media", name: "Media", collectionType: "mixed", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-movie",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "shared:item:2",
+    json: { Id: "main-movie", Type: "Movie", Name: "Priority Movie", ParentId: "library-a" }
+  });
+  store.db.prepare("UPDATE indexed_items SET updated_at = ? WHERE server_id = ? AND item_id = ?").run("2026-01-01T00:00:00.000Z", "main", "main-movie");
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const token = login.json().AccessToken;
+  const checkpoint = await app.inject({
+    method: "POST",
+    url: `/InfuseSync/Checkpoint?deviceId=device-2&userId=${login.json().User.Id}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-video",
+    libraryId: "library-b",
+    itemType: "Video",
+    logicalKey: "shared:item:2",
+    json: { Id: "remote-video", Type: "Video", Name: "Lower Priority Video", ParentId: "library-b" }
+  });
+
+  const startSync = await app.inject({
+    method: "POST",
+    url: `/InfuseSync/Checkpoint/${checkpoint.json().Id}/StartSync`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(startSync.statusCode, 200);
+  assert.equal(startSync.json().UpdatedVideos, 1);
+
+  const updatedMovies = await app.inject({
+    method: "GET",
+    url: `/InfuseSync/Checkpoint/${checkpoint.json().Id}/UpdatedItems?IncludeItemTypes=Movie`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+
+  assert.equal(updatedMovies.statusCode, 200);
+  assert.equal(updatedMovies.json().TotalRecordCount, 1);
+  assert.equal(updatedMovies.json().Items[0].Id, bridgeItemId("shared:item:2"));
+  assert.equal(updatedMovies.json().Items[0].Name, "Priority Movie");
+
+  await app.close();
+  store.close();
+});
+
+test("InfuseSync user data item type filtering uses the selected merged item type", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "media", name: "Media", collectionType: "mixed", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const store = new Store(":memory:");
+  const bridgeId = bridgeItemId("shared:item:3");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-series",
+    libraryId: "library-a",
+    itemType: "Series",
+    logicalKey: "shared:item:3",
+    json: { Id: "main-series", Type: "Series", Name: "Priority Series", ParentId: "library-a" }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-movie",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "shared:item:3",
+    json: { Id: "remote-movie", Type: "Movie", Name: "Lower Priority Movie", ParentId: "library-b" }
+  });
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const token = login.json().AccessToken;
+  const checkpoint = await app.inject({
+    method: "POST",
+    url: `/InfuseSync/Checkpoint?deviceId=device-3&userId=${login.json().User.Id}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  store.upsertUserData(login.json().User.Id, bridgeId, { isFavorite: true });
+  const startSync = await app.inject({
+    method: "POST",
+    url: `/InfuseSync/Checkpoint/${checkpoint.json().Id}/StartSync`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(startSync.statusCode, 200);
+
+  const movieUserData = await app.inject({
+    method: "GET",
+    url: `/InfuseSync/Checkpoint/${checkpoint.json().Id}/UserData?IncludeItemTypes=Movie`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(movieUserData.statusCode, 200);
+  assert.deepEqual(movieUserData.json(), { Items: [], TotalRecordCount: 0, StartIndex: 0 });
+
+  const seriesUserData = await app.inject({
+    method: "GET",
+    url: `/InfuseSync/Checkpoint/${checkpoint.json().Id}/UserData?IncludeItemTypes=Series`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(seriesUserData.statusCode, 200);
+  assert.equal(seriesUserData.json().TotalRecordCount, 1);
+  assert.equal(seriesUserData.json().Items[0].ItemId, bridgeId);
 
   await app.close();
   store.close();
@@ -1319,6 +1453,223 @@ test("root item browse discovers pass-through upstream views live", async () => 
 
   assert.equal(rootItems.statusCode, 200);
   assert.deepEqual(rootItems.json().Items.map((item: any) => item.Name), ["Main - YouTube"]);
+
+  await app.close();
+  store.close();
+});
+
+test("paged cached item browse reads the indexed catalog once on cache hits", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }] }]
+  };
+  const store = new Store(":memory:");
+  for (let index = 0; index < 5; index += 1) {
+    store.upsertIndexedItem({
+      serverId: "main",
+      itemId: `movie-${index}`,
+      libraryId: "library-a",
+      itemType: "Movie",
+      logicalKey: `movie:tmdb:${index}`,
+      json: { Id: `movie-${index}`, Type: "Movie", Name: `Movie ${index}`, SortName: `Movie ${index}`, ProviderIds: { Tmdb: String(index) } }
+    });
+  }
+  const originalListIndexedItems = store.listIndexedItems.bind(store);
+  let catalogReads = 0;
+  store.listIndexedItems = () => {
+    catalogReads += 1;
+    return originalListIndexedItems();
+  };
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/Items?Recursive=true&IncludeItemTypes=Movie&StartIndex=1&Limit=2",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().TotalRecordCount, 5);
+  assert.deepEqual(response.json().Items.map((item: any) => item.Name), ["Movie 1", "Movie 2"]);
+  assert.equal(catalogReads, 1);
+
+  await app.close();
+  store.close();
+});
+
+test("recursive item browse pushes include item types into the indexed catalog read", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "media", name: "Media", collectionType: "mixed", sources: [{ server: "main", libraryId: "library-a" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "movie-a",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:tmdb:100",
+    json: { Id: "movie-a", Type: "Movie", Name: "Movie A", ProviderIds: { Tmdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "library-a",
+    itemType: "Series",
+    logicalKey: "series:tvdb:200",
+    json: { Id: "series-a", Type: "Series", Name: "Series A", ProviderIds: { Tvdb: "200" } }
+  });
+  type InstrumentedStore = Store & { listIndexedItems: (itemTypes?: string[]) => ReturnType<Store["listIndexedItems"]> };
+  const instrumented = store as InstrumentedStore;
+  const originalListIndexedItems = instrumented.listIndexedItems.bind(store);
+  let requestedItemTypes: string[] = [];
+  instrumented.listIndexedItems = (itemTypes = []) => {
+    requestedItemTypes = itemTypes;
+    return originalListIndexedItems(itemTypes);
+  };
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/Items?Recursive=true&includeItemTypes=movie",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(requestedItemTypes.map((type) => type.toLowerCase()), ["movie"]);
+  assert.deepEqual(response.json().Items.map((item: any) => item.Name), ["Movie A"]);
+
+  await app.close();
+  store.close();
+});
+
+test("cached bridge item browse batches user data and related source id hydration", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "shows-lib",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "series-a", Type: "Series", Name: "Series A", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-a",
+    libraryId: "shows-lib",
+    itemType: "Season",
+    logicalKey: "season:series:series-a:season:1",
+    json: { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }
+  });
+  for (let index = 1; index <= 3; index += 1) {
+    store.upsertIndexedItem({
+      serverId: "main",
+      itemId: `episode-${index}`,
+      libraryId: "shows-lib",
+      itemType: "Episode",
+      logicalKey: `episode:series:series-a:season:1:episode:${index}`,
+      json: {
+        Id: `episode-${index}`,
+        Type: "Episode",
+        Name: `Episode ${index}`,
+        ParentId: "season-a",
+        SeriesId: "series-a",
+        SeasonId: "season-a",
+        ParentIndexNumber: 1,
+        IndexNumber: index
+      }
+    });
+  }
+  const originalGetUserData = store.getUserData.bind(store);
+  const originalFindSourceId = store.findIndexedItemsBySourceId.bind(store);
+  let singleUserDataReads = 0;
+  let singleSourceIdReads = 0;
+  store.getUserData = (userIdValue, itemIdValue) => {
+    singleUserDataReads += 1;
+    return originalGetUserData(userIdValue, itemIdValue);
+  };
+  store.findIndexedItemsBySourceId = (itemIdValue) => {
+    singleSourceIdReads += 1;
+    return originalFindSourceId(itemIdValue);
+  };
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/Items?Recursive=true&IncludeItemTypes=Episode&StartIndex=0&Limit=2",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().TotalRecordCount, 3);
+  assert.deepEqual(response.json().Items.map((item: any) => item.Name), ["Episode 1", "Episode 2"]);
+  assert.equal(singleUserDataReads, 0);
+  assert.equal(singleSourceIdReads, 0);
+
+  await app.close();
+  store.close();
+});
+
+test("cached item type filtering preserves priority source selection for merged items", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "media", name: "Media", collectionType: "mixed", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-series",
+    libraryId: "library-a",
+    itemType: "Series",
+    logicalKey: "shared:item:1",
+    json: { Id: "main-series", Type: "Series", Name: "Priority Series", ParentId: "library-a" }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-movie",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "shared:item:1",
+    json: { Id: "remote-movie", Type: "Movie", Name: "Lower Priority Movie", ParentId: "library-b" }
+  });
+  const upstream = new FakeUpstream({
+    "main:/Items": { Items: [], TotalRecordCount: 0 },
+    "remote:/Items": { Items: [], TotalRecordCount: 0 }
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+
+  const response = await app.inject({
+    method: "GET",
+    url: "/Items?Recursive=true&IncludeItemTypes=Movie",
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.json().TotalRecordCount, 0);
+  assert.deepEqual(response.json().Items, []);
 
   await app.close();
   store.close();
@@ -3681,6 +4032,96 @@ test("cached show season and episode routes use targeted indexed children", asyn
   });
   assert.equal(episodes.statusCode, 200);
   assert.deepEqual(episodes.json().Items.map((item: any) => item.Name), ["Episode 1"]);
+
+  await app.close();
+  store.close();
+});
+
+test("cached show child routes preserve priority source selection after type narrowing", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-a" }, { server: "remote", libraryId: "shows-b" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-series",
+    libraryId: "shows-a",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "main-series", Type: "Series", Name: "Priority Series", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-series",
+    libraryId: "shows-b",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "remote-series", Type: "Series", Name: "Remote Series", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-season",
+    libraryId: "shows-a",
+    itemType: "Folder",
+    logicalKey: "season:mismatched:1",
+    json: { Id: "main-season", Type: "Folder", Name: "Priority Folder", SeriesId: "main-series", IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-season",
+    libraryId: "shows-b",
+    itemType: "Season",
+    logicalKey: "season:mismatched:1",
+    json: { Id: "remote-season", Type: "Season", Name: "Lower Priority Season", SeriesId: "remote-series", IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-episode",
+    libraryId: "shows-a",
+    itemType: "Video",
+    logicalKey: "episode:mismatched:1",
+    json: { Id: "main-episode", Type: "Video", Name: "Priority Video", SeriesId: "main-series", ParentIndexNumber: 1, IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-episode",
+    libraryId: "shows-b",
+    itemType: "Episode",
+    logicalKey: "episode:mismatched:1",
+    json: { Id: "remote-episode", Type: "Episode", Name: "Lower Priority Episode", SeriesId: "remote-series", ParentIndexNumber: 1, IndexNumber: 1 }
+  });
+  const upstream = new FakeUpstream({
+    "main:/Shows/main-series/Seasons": { Items: [] },
+    "remote:/Shows/remote-series/Seasons": { Items: [] },
+    "main:/Shows/main-series/Episodes": { Items: [] },
+    "remote:/Shows/remote-series/Episodes": { Items: [] }
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const seriesId = bridgeItemId("series:tvdb:100");
+
+  const seasons = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Seasons`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(seasons.statusCode, 200);
+  assert.deepEqual(seasons.json(), { Items: [], TotalRecordCount: 0, StartIndex: 0 });
+
+  const episodes = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Episodes`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  assert.equal(episodes.statusCode, 200);
+  assert.deepEqual(episodes.json(), { Items: [], TotalRecordCount: 0, StartIndex: 0 });
 
   await app.close();
   store.close();

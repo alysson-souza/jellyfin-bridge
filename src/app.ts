@@ -6,7 +6,7 @@ import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId, pas
 import { rewriteHlsPlaylist } from "./hls.js";
 import { Indexer } from "./indexer.js";
 import { libraryDto, passThroughLibraryDto, publicSystemInfo, queryResult, sessionInfo, systemInfo, userDataDto } from "./jellyfin.js";
-import { bridgeItemIdMapForSourceItem, bridgeItemSources, getBridgeItem, itemCounts, listBridgeItems, listBridgeItemsForSourceParents, queryBridgeItems, queryBridgeItemsFromIndexedItems } from "./library.js";
+import { bridgeItemIdMapForSourceItem, bridgeItemSources, countBridgeItemsFromIndexedItems, getBridgeItem, itemCounts, listBridgeItems, listBridgeItemsForSourceParents, queryBridgeItems, queryBridgeItemsFromIndexedItems } from "./library.js";
 import type { BrowseQuery } from "./library.js";
 import { logicalItemKey, type SourceItem } from "./merge.js";
 import { findMetadataItem, listAlbumArtists, listArtists, listGenres, listPersons, listStudios, listYears } from "./metadata.js";
@@ -286,7 +286,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     requireSelf(auth, checkpoint.userId);
     const syncWindow = requireCompletedInfuseSyncCheckpoint(checkpoint);
     const query = infuseSyncBrowseQuery(request.query);
-    const rows = store.listUserDataUpdatedBetween(checkpoint.userId, syncWindow.fromTimestamp, syncWindow.syncTimestamp, parseInfuseSyncItemTypes(request.query));
+    const rows = filterInfuseSyncUserDataRows(
+      store.listUserDataUpdatedBetween(checkpoint.userId, syncWindow.fromTimestamp, syncWindow.syncTimestamp),
+      parseInfuseSyncItemTypes(request.query)
+    );
     const start = query.startIndex ?? 0;
     const end = query.limit === undefined ? undefined : start + query.limit;
     return queryResult(rows.slice(start, end).map(infuseSyncUserDataDto), start, rows.length);
@@ -812,15 +815,14 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       const start = query.startIndex ?? 0;
       return queryResult(views, start, views.length);
     }
-    const unpagedQuery = { ...query, startIndex: undefined, limit: undefined };
-    const cachedTotal = queryBridgeItems(snapshotConfig, store, userIdValue, unpagedQuery).total;
-    if (cachedTotal === 0) {
+    let result = queryBridgeItems(snapshotConfig, store, userIdValue, query);
+    if (result.total === 0) {
       await refreshLiveBrowse(snapshotConfig, client, query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream browse failed: ${detail}`);
       });
+      result = queryBridgeItems(snapshotConfig, store, userIdValue, query);
     }
-    const result = queryBridgeItems(snapshotConfig, store, userIdValue, query);
     return queryResult(result.items, query.startIndex ?? 0, result.total);
   }
 
@@ -1936,7 +1938,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const changedItems = store.listIndexedItemsUpdatedBetween(checkpoint.fromTimestamp, checkpoint.syncTimestamp);
     const videoItemTypes = "Movie,Episode,Video,MusicVideo";
     const updatedCount = (includeItemTypes: string): number =>
-      queryBridgeItemsFromIndexedItems(config, store, checkpoint.userId, changedItems, { includeItemTypes }).total;
+      countBridgeItemsFromIndexedItems(config, store, changedItems, includeItemTypes);
     return {
       UpdatedFolders: updatedCount("Folder"),
       RemovedFolders: 0,
@@ -1951,8 +1953,22 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       UpdatedVideos: updatedCount(videoItemTypes),
       RemovedVideos: 0,
       UpdatedCollectionFolders: updatedCount("CollectionFolder"),
-      UpdatedUserData: store.listUserDataUpdatedBetween(checkpoint.userId, checkpoint.fromTimestamp, checkpoint.syncTimestamp, includeItemTypeList(videoItemTypes)).length
+      UpdatedUserData: filterInfuseSyncUserDataRows(
+        store.listUserDataUpdatedBetween(checkpoint.userId, checkpoint.fromTimestamp, checkpoint.syncTimestamp),
+        includeItemTypeList(videoItemTypes)
+      ).length
     };
+  }
+
+  function filterInfuseSyncUserDataRows(rows: UserDataRecord[], itemTypes: string[]): UserDataRecord[] {
+    const includeTypes = new Set(itemTypes.map((type) => type.trim().toLowerCase()).filter(Boolean));
+    if (includeTypes.size === 0) return rows;
+    const sourcesByBridgeId = store.findIndexedItemsByBridgeIds(rows.map((row) => row.itemId));
+    return rows.filter((row) => {
+      const selected = sortIndexedSourcesByPriority(sourcesByBridgeId.get(row.itemId) ?? [])[0];
+      const type = String(selected?.json.Type ?? selected?.itemType ?? "").toLowerCase();
+      return includeTypes.has(type);
+    });
   }
 
   function displayPreferencesDto(id: string, client: string): Record<string, unknown> {
