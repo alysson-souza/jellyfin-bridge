@@ -8,6 +8,7 @@ import type { BridgeConfig, RuntimeConfigSource } from "../src/config.js";
 import { Store } from "../src/store.js";
 import { bridgeItemId, bridgeLibraryId, bridgeMediaSourceId, bridgeServerId } from "../src/ids.js";
 import { passThroughLibraryId } from "../src/ids.js";
+import { UpstreamClient } from "../src/upstream.js";
 
 test("supports Jellyfin login, authenticated system routes, user views, user data, and logout", async () => {
   const passwordHash = await hash("secret");
@@ -18,7 +19,11 @@ test("supports Jellyfin login, authenticated system routes, user views, user dat
     libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "abc" }] }]
   };
   const store = new Store(":memory:");
-  const app = buildApp({ config, store });
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/UserItems/movie-a/UserData": { Played: true }
+  });
+  const app = buildApp({ config, store, upstream });
 
   const publicInfo = await app.inject({ method: "GET", url: "/System/Info/Public" });
   assert.equal(publicInfo.statusCode, 200);
@@ -1330,6 +1335,490 @@ test("deletes indexed items through the resolved upstream source", async () => {
   store.close();
 });
 
+test("forwards watched playstate writes to every logical upstream source", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-alien",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "remote-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "wrong-main-user", Name: "bob" }, { Id: "main-user", Name: "alice" }],
+    "remote:/Users": [{ Id: "remote-user", Name: "ALICE" }],
+    "main:/UserPlayedItems/main-alien": { Played: true },
+    "remote:/UserPlayedItems/remote-alien": { Played: true }
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const userId = login.json().User.Id;
+  const token = login.json().AccessToken;
+  const alienBridgeId = bridgeItemId("movie:imdb:tt0078748");
+  const datePlayed = "2024-05-01T00:00:00.000Z";
+
+  const played = await app.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${alienBridgeId}?DatePlayed=${encodeURIComponent(datePlayed)}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(played.statusCode, 200);
+  assert.equal(played.json().Played, true);
+  assert.equal(played.json().PlayCount, 1);
+  assert.equal(played.json().LastPlayedDate, datePlayed);
+  assert.equal(store.getUserData(userId, alienBridgeId).Played, true);
+
+  const playedWrites = upstream.requests.filter((request) => request.path.startsWith("/UserPlayedItems/"));
+  assert.deepEqual(playedWrites.map((request) => {
+    const init = request.init as any;
+    return `${request.serverId}:${request.path}:${init.method}:${init.query.userId}:${init.query.datePlayed ?? ""}`;
+  }).sort(), [
+    `main:/UserPlayedItems/main-alien:POST:main-user:${datePlayed}`,
+    `remote:/UserPlayedItems/remote-alien:POST:remote-user:${datePlayed}`
+  ]);
+  assert.deepEqual(upstream.requests.filter((request) => request.path === "/Users").map((request) => {
+    const init = request.init as any;
+    return { serverId: request.serverId, method: init.method, query: init.query, body: init.body };
+  }), [
+    { serverId: "main", method: undefined, query: undefined, body: undefined },
+    { serverId: "remote", method: undefined, query: undefined, body: undefined }
+  ]);
+
+  const unplayed = await app.inject({
+    method: "DELETE",
+    url: `/Users/${userId}/PlayedItems/main-alien`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(unplayed.statusCode, 200);
+  assert.equal(unplayed.json().Played, false);
+  assert.equal(unplayed.json().PlayCount, 0);
+  assert.equal(unplayed.json().LastPlayedDate, null);
+  assert.equal(store.getUserData(userId, alienBridgeId).Played, false);
+  assert.equal(store.listUserData(userId, ["main-alien"]).has("main-alien"), false);
+
+  const allWrites = upstream.requests.filter((request) => request.path.startsWith("/UserPlayedItems/"));
+  assert.deepEqual(allWrites.slice(2).map((request) => {
+    const init = request.init as any;
+    return `${request.serverId}:${request.path}:${init.method}:${init.query.userId}:${init.query.datePlayed ?? ""}`;
+  }).sort(), [
+    "main:/UserPlayedItems/main-alien:DELETE:main-user:",
+    "remote:/UserPlayedItems/remote-alien:DELETE:remote-user:"
+  ]);
+
+  await app.close();
+  store.close();
+});
+
+test("forwards generic watched user data writes and keeps non-watched writes local", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-alien",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "remote-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "remote:/Users": [{ Id: "remote-user", Name: "alice" }],
+    "main:/UserItems/main-alien/UserData": { Played: true },
+    "remote:/UserItems/remote-alien/UserData": { Played: true }
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const userId = login.json().User.Id;
+  const token = login.json().AccessToken;
+  const alienBridgeId = bridgeItemId("movie:imdb:tt0078748");
+  const lastPlayedDate = "2024-05-02T00:00:00.000Z";
+
+  const watchedUserData = await app.inject({
+    method: "POST",
+    url: `/Users/${userId}/Items/${alienBridgeId}/UserData`,
+    headers: { "X-MediaBrowser-Token": token },
+    payload: { Played: true, LastPlayedDate: lastPlayedDate, PlaybackPositionTicks: 1234, IsFavorite: true }
+  });
+  assert.equal(watchedUserData.statusCode, 200);
+  assert.equal(watchedUserData.json().Played, true);
+  assert.equal(watchedUserData.json().LastPlayedDate, lastPlayedDate);
+  assert.equal(watchedUserData.json().PlaybackPositionTicks, 1234);
+  assert.equal(watchedUserData.json().IsFavorite, true);
+  assert.deepEqual(upstream.requests.filter((request) => request.path.includes("/UserData")).map((request) => {
+    const init = request.init as any;
+    return {
+      serverId: request.serverId,
+      path: request.path,
+      method: init.method,
+      query: init.query,
+      body: init.body
+    };
+  }).sort((left, right) => left.serverId.localeCompare(right.serverId)), [
+    {
+      serverId: "main",
+      path: "/UserItems/main-alien/UserData",
+      method: "POST",
+      query: { userId: "main-user" },
+      body: { Played: true, PlaybackPositionTicks: 1234, LastPlayedDate: lastPlayedDate }
+    },
+    {
+      serverId: "remote",
+      path: "/UserItems/remote-alien/UserData",
+      method: "POST",
+      query: { userId: "remote-user" },
+      body: { Played: true, PlaybackPositionTicks: 1234, LastPlayedDate: lastPlayedDate }
+    }
+  ]);
+
+  const upstreamRequestCount = upstream.requests.length;
+  const positionOnly = await app.inject({
+    method: "POST",
+    url: `/UserItems/${alienBridgeId}/UserData`,
+    headers: { "X-MediaBrowser-Token": token },
+    payload: { PlaybackPositionTicks: 4567 }
+  });
+  assert.equal(positionOnly.statusCode, 200);
+  assert.equal(positionOnly.json().PlaybackPositionTicks, 4567);
+  assert.equal(upstream.requests.length, upstreamRequestCount);
+
+  const favoriteOnly = await app.inject({
+    method: "POST",
+    url: `/UserItems/${alienBridgeId}/UserData`,
+    headers: { "X-MediaBrowser-Token": token },
+    payload: { IsFavorite: false }
+  });
+  assert.equal(favoriteOnly.statusCode, 200);
+  assert.equal(favoriteOnly.json().IsFavorite, false);
+  assert.equal(upstream.requests.length, upstreamRequestCount);
+
+  await app.close();
+  store.close();
+});
+
+test("does not mutate local watched state when upstream propagation cannot complete", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }] }]
+  };
+
+  const missingStore = new Store(":memory:");
+  const missingApp = buildApp({ config, store: missingStore, upstream: new FakeUpstream({}) });
+  const missingLogin = await missingApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const missingToken = missingLogin.json().AccessToken;
+  const missingItem = await missingApp.inject({
+    method: "POST",
+    url: "/UserPlayedItems/not-indexed",
+    headers: { "X-MediaBrowser-Token": missingToken }
+  });
+  assert.equal(missingItem.statusCode, 404);
+  const syntheticView = await missingApp.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeLibraryId("movies")}`,
+    headers: { "X-MediaBrowser-Token": missingToken }
+  });
+  assert.equal(syntheticView.statusCode, 404);
+  await missingApp.close();
+  missingStore.close();
+
+  const missingUserStore = new Store(":memory:");
+  missingUserStore.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const missingUserUpstream = new FakeUpstream({
+    "main:/Users": [{ Id: "wrong-user", Name: "bob" }]
+  });
+  const missingUserApp = buildApp({ config, store: missingUserStore, upstream: missingUserUpstream });
+  const missingUserLogin = await missingUserApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const missingUserId = missingUserLogin.json().User.Id;
+  const missingUserPlayed = await missingUserApp.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": missingUserLogin.json().AccessToken }
+  });
+  assert.equal(missingUserPlayed.statusCode, 502);
+  assert.equal(missingUserStore.getUserData(missingUserId, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  assert.equal(missingUserUpstream.requests.filter((request) => request.path.startsWith("/UserPlayedItems/")).length, 0);
+  await missingUserApp.close();
+  missingUserStore.close();
+
+  const failureStore = new Store(":memory:");
+  failureStore.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const failureUpstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/UserPlayedItems/main-alien": new Error("upstream write failed")
+  });
+  const failureApp = buildApp({ config, store: failureStore, upstream: failureUpstream });
+  const failureLogin = await failureApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const failureUserId = failureLogin.json().User.Id;
+  const failurePlayed = await failureApp.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": failureLogin.json().AccessToken }
+  });
+  assert.equal(failurePlayed.statusCode, 502);
+  assert.equal(failureStore.getUserData(failureUserId, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  await failureApp.close();
+  failureStore.close();
+
+  const userDataFailureStore = new Store(":memory:");
+  userDataFailureStore.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  userDataFailureStore.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-alien",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "remote-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const userDataFailureConfig: BridgeConfig = {
+    ...config,
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const userDataFailureUpstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "remote:/Users": [{ Id: "remote-user", Name: "alice" }],
+    "main:/UserItems/main-alien/UserData": { Played: true },
+    "remote:/UserItems/remote-alien/UserData": new Error("remote user data failed")
+  });
+  const userDataFailureApp = buildApp({ config: userDataFailureConfig, store: userDataFailureStore, upstream: userDataFailureUpstream });
+  const userDataFailureLogin = await userDataFailureApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const userDataFailureUserId = userDataFailureLogin.json().User.Id;
+  const userDataFailure = await userDataFailureApp.inject({
+    method: "POST",
+    url: `/Users/${userDataFailureUserId}/Items/${bridgeItemId("movie:imdb:tt0078748")}/UserData`,
+    headers: { "X-MediaBrowser-Token": userDataFailureLogin.json().AccessToken },
+    payload: { Played: true, PlaybackPositionTicks: 1111, IsFavorite: true }
+  });
+  assert.equal(userDataFailure.statusCode, 502);
+  assert.equal(userDataFailureStore.getUserData(userDataFailureUserId, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  assert.equal(userDataFailureStore.getUserData(userDataFailureUserId, bridgeItemId("movie:imdb:tt0078748")).IsFavorite, false);
+  assert.equal(userDataFailureStore.listUserData(userDataFailureUserId, ["main-alien"]).has("main-alien"), false);
+  assert.deepEqual(userDataFailureUpstream.requests
+    .filter((request) => request.path.includes("/UserData"))
+    .map((request) => {
+      const init = request.init as any;
+      return { serverId: request.serverId, path: request.path, body: init.body };
+    }), [
+    { serverId: "main", path: "/UserItems/main-alien/UserData", body: { Played: true, PlaybackPositionTicks: 1111 } },
+    { serverId: "remote", path: "/UserItems/remote-alien/UserData", body: { Played: true, PlaybackPositionTicks: 1111 } }
+  ]);
+  await userDataFailureApp.close();
+  userDataFailureStore.close();
+
+  const partialStore = new Store(":memory:");
+  partialStore.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  partialStore.upsertIndexedItem({
+    serverId: "remote",
+    itemId: "remote-alien",
+    libraryId: "library-b",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "remote-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const partialConfig: BridgeConfig = {
+    ...config,
+    upstreams: [
+      { id: "main", name: "Main", url: "https://main.example.com", token: "token" },
+      { id: "remote", name: "Remote", url: "https://remote.example.com", token: "token" }
+    ],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "library-a" }, { server: "remote", libraryId: "library-b" }] }]
+  };
+  const partialUpstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "remote:/Users": [{ Id: "remote-user", Name: "alice" }],
+    "main:/UserPlayedItems/main-alien": { Played: true },
+    "remote:/UserPlayedItems/remote-alien": new Error("remote write failed")
+  });
+  const partialApp = buildApp({ config: partialConfig, store: partialStore, upstream: partialUpstream });
+  const partialLogin = await partialApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const partialUserId = partialLogin.json().User.Id;
+  const partialPlayed = await partialApp.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": partialLogin.json().AccessToken }
+  });
+  assert.equal(partialPlayed.statusCode, 502);
+  assert.equal(partialStore.getUserData(partialUserId, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  assert.deepEqual(partialUpstream.requests
+    .filter((request) => request.path.startsWith("/UserPlayedItems/"))
+    .map((request) => `${request.serverId}:${request.path}`), [
+    "main:/UserPlayedItems/main-alien",
+    "remote:/UserPlayedItems/remote-alien"
+  ]);
+  await partialApp.close();
+  partialStore.close();
+
+  const upstream404Store = new Store(":memory:");
+  upstream404Store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const upstream404Client = new UpstreamClient(config.upstreams, {
+    request: async (url) => {
+      if (url.pathname === "/Users") {
+        return {
+          statusCode: 200,
+          headers: {},
+          body: { json: async () => [{ Id: "main-user", Name: "alice" }] }
+        };
+      }
+      return {
+        statusCode: 404,
+        headers: {},
+        body: { json: async () => ({ error: "not found" }) }
+      };
+    },
+    retries: 0
+  });
+  const upstream404App = buildApp({ config, store: upstream404Store, upstream: upstream404Client });
+  const upstream404Login = await upstream404App.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const upstream404Played = await upstream404App.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": upstream404Login.json().AccessToken }
+  });
+  assert.equal(upstream404Played.statusCode, 502);
+  assert.equal(upstream404Store.getUserData(upstream404Login.json().User.Id, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  await upstream404App.close();
+  upstream404Store.close();
+
+  const userLookupFailureStore = new Store(":memory:");
+  userLookupFailureStore.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const userLookupFailureClient = new UpstreamClient(config.upstreams, {
+    request: async () => ({
+      statusCode: 404,
+      headers: {},
+      body: { json: async () => ({ error: "users not found" }) }
+    }),
+    retries: 0
+  });
+  const userLookupFailureApp = buildApp({ config, store: userLookupFailureStore, upstream: userLookupFailureClient });
+  const userLookupFailureLogin = await userLookupFailureApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const userLookupFailurePlayed = await userLookupFailureApp.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": userLookupFailureLogin.json().AccessToken }
+  });
+  assert.equal(userLookupFailurePlayed.statusCode, 502);
+  assert.equal(userLookupFailureStore.getUserData(userLookupFailureLogin.json().User.Id, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  await userLookupFailureApp.close();
+  userLookupFailureStore.close();
+
+  const nonJsonStore = new Store(":memory:");
+  nonJsonStore.upsertIndexedItem({
+    serverId: "main",
+    itemId: "main-alien",
+    libraryId: "library-a",
+    itemType: "Movie",
+    logicalKey: "movie:imdb:tt0078748",
+    json: { Id: "main-alien", Type: "Movie", Name: "Alien", ProviderIds: { Imdb: "tt0078748" } }
+  });
+  const nonJsonUpstream = new UpstreamClient(config.upstreams, {
+    request: async (url) => {
+      if (url.pathname === "/Users") {
+        return {
+          statusCode: 200,
+          headers: {},
+          body: { json: async () => [{ Id: "main-user", Name: "alice" }] }
+        };
+      }
+      return { statusCode: 200, headers: {}, body: "not json" };
+    },
+    retries: 0
+  });
+  const nonJsonApp = buildApp({ config, store: nonJsonStore, upstream: nonJsonUpstream });
+  const nonJsonLogin = await nonJsonApp.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const nonJsonPlayed = await nonJsonApp.inject({
+    method: "POST",
+    url: `/UserPlayedItems/${bridgeItemId("movie:imdb:tt0078748")}`,
+    headers: { "X-MediaBrowser-Token": nonJsonLogin.json().AccessToken }
+  });
+  assert.equal(nonJsonPlayed.statusCode, 502);
+  assert.equal(nonJsonStore.getUserData(nonJsonLogin.json().User.Id, bridgeItemId("movie:imdb:tt0078748")).Played, false);
+  await nonJsonApp.close();
+  nonJsonStore.close();
+});
+
 test("rejects cross-user state access for non-admin bridge users", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
@@ -1351,8 +1840,11 @@ test("rejects cross-user state access for non-admin bridge users", async () => {
     { method: "GET", url: `/Users/${bobId}/Items` },
     { method: "GET", url: `/UserItems/${itemId}/UserData?UserId=${bobId}` },
     { method: "GET", url: `/UserItems/${itemId}/UserData?userId=${bobId}` },
+    { method: "POST", url: `/UserItems/${itemId}/UserData?UserId=${bobId}`, payload: { Played: true } },
     { method: "POST", url: `/Users/${bobId}/Items/${itemId}/UserData`, payload: { IsFavorite: true } },
     { method: "POST", url: `/Users/${bobId}/FavoriteItems/${itemId}` },
+    { method: "POST", url: `/UserPlayedItems/${itemId}?UserId=${bobId}` },
+    { method: "DELETE", url: `/UserPlayedItems/${itemId}?userId=${bobId}` },
     { method: "DELETE", url: `/Users/${bobId}/PlayedItems/${itemId}` }
   ] as const) {
     const response = await app.inject({
@@ -1719,7 +2211,13 @@ test("serves indexed items as merged bridge items", async () => {
     logicalKey: "movie:tmdb:329865",
     json: { Id: "remote-arrival", Type: "Movie", Name: "Arrival", ServerId: "remote", Genres: ["Science Fiction"], DateCreated: "2024-02-01T00:00:00.000Z", ProviderIds: { Tmdb: "329865" } }
   });
-  const app = buildApp({ config, store });
+  const playstateUpstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "remote:/Users": [{ Id: "remote-user", Name: "alice" }],
+    "main:/UserPlayedItems/main-alien": { Played: true },
+    "remote:/UserPlayedItems/remote-alien": { Played: true }
+  });
+  const app = buildApp({ config, store, upstream: playstateUpstream });
 
   const login = await app.inject({
     method: "POST",

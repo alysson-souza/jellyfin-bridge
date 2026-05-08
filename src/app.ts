@@ -47,6 +47,13 @@ interface RawProxyCandidate {
   path: string;
 }
 
+interface WatchedWriteTarget {
+  bridgeItemId: string;
+  sources: IndexedItemRecord[];
+}
+
+type WatchedUserDataPayload = Record<string, boolean | number | string>;
+
 const LIVE_BROWSE_FIELDS = [
   "BasicSyncInfo",
   "CanDelete",
@@ -665,15 +672,32 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.post("/UserItems/:itemId/UserData", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
-    if (!canWriteUserData(auth.session.userId, itemId)) return notFound(reply, "Item not found");
-    saveUserData(store, auth.session.userId, itemId, request.body);
-    return userDataDto(store, auth.session.userId, itemId);
+    const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
+    const watchedPayload = watchedUserDataPayload(request.body);
+    if (watchedPayload) {
+      const target = resolveWatchedWriteTarget(itemId);
+      if (!target) return notFound(reply, "Item not found");
+      await forwardWatchedUserData(target.sources, auth.user.name, watchedPayload);
+      saveUserData(store, userIdValue, target.bridgeItemId, request.body);
+      return userDataDto(store, userIdValue, target.bridgeItemId);
+    }
+    if (!canWriteUserData(userIdValue, itemId)) return notFound(reply, "Item not found");
+    saveUserData(store, userIdValue, itemId, request.body);
+    return userDataDto(store, userIdValue, itemId);
   });
 
   app.post("/Users/:userId/Items/:itemId/UserData", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
+    const watchedPayload = watchedUserDataPayload(request.body);
+    if (watchedPayload) {
+      const target = resolveWatchedWriteTarget(itemId);
+      if (!target) return notFound(reply, "Item not found");
+      await forwardWatchedUserData(target.sources, auth.user.name, watchedPayload);
+      saveUserData(store, userIdValue, target.bridgeItemId, request.body);
+      return userDataDto(store, userIdValue, target.bridgeItemId);
+    }
     if (!canWriteUserData(userIdValue, itemId)) return notFound(reply, "Item not found");
     saveUserData(store, userIdValue, itemId, request.body);
     return userDataDto(store, userIdValue, itemId);
@@ -712,31 +736,43 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.post("/UserPlayedItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
-    if (!canWriteUserData(auth.session.userId, itemId)) return notFound(reply, "Item not found");
-    return setPlayed(auth.session.userId, itemId, true, datePlayedFromQuery(request.query));
+    const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
+    const target = resolveWatchedWriteTarget(itemId);
+    if (!target) return notFound(reply, "Item not found");
+    const datePlayed = datePlayedFromQuery(request.query);
+    await forwardPlayedState(target.sources, auth.user.name, true, datePlayed);
+    return setPlayed(userIdValue, target.bridgeItemId, true, datePlayed);
   });
 
   app.delete("/UserPlayedItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
-    if (!canWriteUserData(auth.session.userId, itemId)) return notFound(reply, "Item not found");
-    return setPlayed(auth.session.userId, itemId, false);
+    const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
+    const target = resolveWatchedWriteTarget(itemId);
+    if (!target) return notFound(reply, "Item not found");
+    await forwardPlayedState(target.sources, auth.user.name, false);
+    return setPlayed(userIdValue, target.bridgeItemId, false);
   });
 
   app.post("/Users/:userId/PlayedItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    if (!canWriteUserData(userIdValue, itemId)) return notFound(reply, "Item not found");
-    return setPlayed(userIdValue, itemId, true, datePlayedFromQuery(request.query));
+    const target = resolveWatchedWriteTarget(itemId);
+    if (!target) return notFound(reply, "Item not found");
+    const datePlayed = datePlayedFromQuery(request.query);
+    await forwardPlayedState(target.sources, auth.user.name, true, datePlayed);
+    return setPlayed(userIdValue, target.bridgeItemId, true, datePlayed);
   });
 
   app.delete("/Users/:userId/PlayedItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    if (!canWriteUserData(userIdValue, itemId)) return notFound(reply, "Item not found");
-    return setPlayed(userIdValue, itemId, false);
+    const target = resolveWatchedWriteTarget(itemId);
+    if (!target) return notFound(reply, "Item not found");
+    await forwardPlayedState(target.sources, auth.user.name, false);
+    return setPlayed(userIdValue, target.bridgeItemId, false);
   });
 
   app.post("/Sessions/Playing", async (request, reply) => {
@@ -2076,6 +2112,77 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return userDataDto(store, userIdValue, itemId);
   }
 
+  function resolveWatchedWriteTarget(itemIdValue: string): WatchedWriteTarget | undefined {
+    const bridgeSources = bridgeItemSources(config, store, itemIdValue);
+    if (bridgeSources.length > 0) {
+      return { bridgeItemId: itemIdValue, sources: bridgeSources };
+    }
+
+    const directSources = store.findIndexedItemsBySourceId(itemIdValue);
+    const logicalKeys = Array.from(new Set(directSources.map((source) => source.logicalKey)));
+    if (logicalKeys.length !== 1) return undefined;
+    const resolvedBridgeItemId = bridgeItemId(logicalKeys[0]);
+    const sources = bridgeItemSources(config, store, resolvedBridgeItemId);
+    return sources.length > 0 ? { bridgeItemId: resolvedBridgeItemId, sources } : undefined;
+  }
+
+  async function forwardPlayedState(sources: IndexedItemRecord[], userName: string, played: boolean, datePlayed?: string): Promise<void> {
+    const userIds = new Map<string, string>();
+    for (const source of sources) {
+      const upstreamUserId = await exactUpstreamUserIdForWrite(source.serverId, userName, userIds);
+      try {
+        await upstream.json<Record<string, unknown>>(source.serverId, `/UserPlayedItems/${source.itemId}`, {
+          method: played ? "POST" : "DELETE",
+          query: played ? { userId: upstreamUserId, datePlayed } : { userId: upstreamUserId }
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw badGatewayError(`Upstream watched state write failed: ${detail}`);
+      }
+    }
+  }
+
+  async function forwardWatchedUserData(sources: IndexedItemRecord[], userName: string, payload: WatchedUserDataPayload): Promise<void> {
+    const userIds = new Map<string, string>();
+    for (const source of sources) {
+      const upstreamUserId = await exactUpstreamUserIdForWrite(source.serverId, userName, userIds);
+      try {
+        await upstream.json<Record<string, unknown>>(source.serverId, `/UserItems/${source.itemId}/UserData`, {
+          method: "POST",
+          query: { userId: upstreamUserId },
+          body: payload
+        });
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw badGatewayError(`Upstream watched user data write failed: ${detail}`);
+      }
+    }
+  }
+
+  async function exactUpstreamUserIdForWrite(serverIdValue: string, userName: string, cache: Map<string, string>): Promise<string> {
+    const cached = cache.get(serverIdValue);
+    if (cached) return cached;
+    let users: unknown;
+    try {
+      users = await upstream.json<unknown>(serverIdValue, "/Users", {});
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw badGatewayError(`Upstream user lookup failed: ${detail}`);
+    }
+    if (!Array.isArray(users)) {
+      throw badGatewayError(`Upstream user lookup failed: /Users on ${serverIdValue} did not return a user list`);
+    }
+    const upstreamUserId = users.find((user) => {
+      if (!isRecord(user)) return false;
+      return typeof user.Id === "string" && typeof user.Name === "string" && user.Name.toLowerCase() === userName.toLowerCase();
+    })?.Id;
+    if (!upstreamUserId) {
+      throw badGatewayError(`Upstream user ${userName} was not found on ${serverIdValue}`);
+    }
+    cache.set(serverIdValue, upstreamUserId);
+    return upstreamUserId;
+  }
+
   function setPlayed(userIdValue: string, itemId: string, played: boolean, datePlayed?: string): Record<string, unknown> {
     if (!played) {
       store.upsertUserData(userIdValue, itemId, { played: false, playbackPositionTicks: 0, playCount: 0, lastPlayedDate: null });
@@ -3110,6 +3217,21 @@ function saveUserData(store: Store, userIdValue: string, itemId: string, body: u
     playCount: typeof data.PlayCount === "number" ? data.PlayCount : undefined,
     lastPlayedDate: typeof data.LastPlayedDate === "string" ? data.LastPlayedDate : undefined
   });
+}
+
+function watchedUserDataPayload(body: unknown): WatchedUserDataPayload | undefined {
+  if (!isRecord(body)) return undefined;
+  const triggersWatchedWrite = typeof body.Played === "boolean"
+    || typeof body.PlayCount === "number"
+    || typeof body.LastPlayedDate === "string";
+  if (!triggersWatchedWrite) return undefined;
+
+  const payload: WatchedUserDataPayload = {};
+  if (typeof body.Played === "boolean") payload.Played = body.Played;
+  if (typeof body.PlayCount === "number") payload.PlayCount = body.PlayCount;
+  if (typeof body.LastPlayedDate === "string") payload.LastPlayedDate = body.LastPlayedDate;
+  if (typeof body.PlaybackPositionTicks === "number") payload.PlaybackPositionTicks = body.PlaybackPositionTicks;
+  return payload;
 }
 
 function metadataQuery(query: unknown): { parentId?: string; searchTerm?: string; startIndex?: number; limit?: number; personTypes?: string } {
