@@ -96,6 +96,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   let serverId = bridgeServerId(config.server.name);
   let configVersion = 0;
   const liveUserCache = new Map<string, { expiresAt: number; promise: Promise<string | undefined> }>();
+  const metadataNamesById = new Map<string, { type: MetadataBrowseType; name: string }>();
   const liveUserCacheTtlMs = 5 * 60_000;
   const unsubscribeConfig = configSource.subscribe((nextConfig) => {
     config = nextConfig;
@@ -938,6 +939,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       query.ParentId = source.libraryId;
     }
     rewriteSeriesIdForSource(query, rawQuery, source);
+    rewriteMetadataIdFilters(query);
     return query;
   }
 
@@ -1127,7 +1129,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     if (!sawResponse) return undefined;
     const merged = Array.from(names.values())
       .sort((left, right) => left.localeCompare(right))
-      .map((name) => findMetadataItem(config, name, type));
+      .map((name) => {
+        rememberMetadataName(type, name);
+        return findMetadataItem(config, name, type);
+      });
     const startIndex = startIndexFrom(rawQuery) ?? 0;
     const limit = limitFrom(rawQuery);
     const paged = limit === undefined ? merged.slice(startIndex) : merged.slice(startIndex, startIndex + limit);
@@ -1327,6 +1332,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       query.ParentId = source.libraryId;
     }
     rewriteSeriesIdForSource(query, rawQuery, source);
+    rewriteMetadataIdFilters(query);
     const upstreamUserId = await liveUserId(client, cacheVersion, source.serverId, userName);
     if (upstreamUserId) {
       query.UserId = upstreamUserId;
@@ -1359,6 +1365,35 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     if (!mapped) return;
     delete query.seriesId;
     query.SeriesId = mapped.itemId;
+  }
+
+  function rewriteMetadataIdFilters(query: LiveQueryParams): void {
+    rewriteMetadataIdFilter(query, "GenreIds", "genreIds", "Genres", "Genre");
+    rewriteMetadataIdFilter(query, "StudioIds", "studioIds", "Studios", "Studio");
+  }
+
+  function rewriteMetadataIdFilter(query: LiveQueryParams, upperIdKey: string, lowerIdKey: string, nameKey: string, type: MetadataBrowseType): void {
+    const rawIds = query[upperIdKey] ?? query[lowerIdKey];
+    if (rawIds === undefined) return;
+    const ids = splitFilterValue(rawIds).map(normalizedMetadataId);
+    if (ids.length === 0) return;
+    const names = ids
+      .flatMap((id) => {
+        const entry = metadataNamesById.get(id);
+        return entry?.type === type ? [entry.name] : [];
+      });
+    if (names.length !== ids.length) return;
+
+    delete query[upperIdKey];
+    delete query[lowerIdKey];
+    query[nameKey] = uniqueStrings([
+      ...splitFilterValue(query[nameKey]),
+      ...names
+    ]).join(",");
+  }
+
+  function rememberMetadataName(type: MetadataBrowseType, name: string): void {
+    metadataNamesById.set(normalizedMetadataId(bridgeItemId(`${type.toLowerCase()}:${name.toLowerCase()}`)), { type, name });
   }
 
   function latestLiveQueryForSource(
@@ -3467,8 +3502,10 @@ function browseQuery(query: unknown): BrowseQuery {
     parentId: value.ParentId ?? value.parentId,
     recursive: booleanQuery(value.Recursive ?? value.recursive),
     genres: value.Genres ?? value.genres,
+    genreIds: value.GenreIds ?? value.genreIds,
     tags: value.Tags ?? value.tags,
     studios: value.Studios ?? value.studios,
+    studioIds: value.StudioIds ?? value.studioIds,
     artists: value.Artists ?? value.artists,
     person: value.Person ?? value.person,
     years: value.Years ?? value.years,
@@ -3601,6 +3638,14 @@ function seriesIdFrom(query: unknown): string | undefined {
 
 function includeItemTypeList(value: string | undefined): string[] {
   return value?.split(",").map((type) => type.trim().toLowerCase()).filter(Boolean) ?? [];
+}
+
+function splitFilterValue(value: string | number | boolean | undefined): string[] {
+  return value === undefined ? [] : String(value).split(/[|,]/).map((item) => item.trim()).filter(Boolean);
+}
+
+function normalizedMetadataId(value: string): string {
+  return value.replaceAll("-", "").toLowerCase();
 }
 
 function latestIncludeItemTypesForCollection(collectionType: string | null | undefined): string | undefined {

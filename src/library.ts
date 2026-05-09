@@ -9,8 +9,10 @@ export interface BrowseQuery {
   parentId?: string;
   recursive?: boolean;
   genres?: string;
+  genreIds?: string;
   tags?: string;
   studios?: string;
+  studioIds?: string;
   artists?: string;
   person?: string;
   years?: string;
@@ -79,8 +81,10 @@ function queryBridgeItemGroups(
   const includeTypes = parseList(query.includeItemTypes).map((type) => type.toLowerCase());
   const mediaTypes = parseList(query.mediaTypes).map((type) => type.toLowerCase());
   const genres = parseFilterList(query.genres).map((genre) => genre.toLowerCase());
+  const genreIds = parseFilterList(query.genreIds).map(normalizedMetadataId);
   const tags = parseFilterList(query.tags).map((tag) => tag.toLowerCase());
   const studios = parseFilterList(query.studios).map((studio) => studio.toLowerCase());
+  const studioIds = parseFilterList(query.studioIds).map(normalizedMetadataId);
   const artists = parseFilterList(query.artists).map((artist) => artist.toLowerCase());
   const years = parseNumberList(query.years);
   const officialRatings = parseFilterList(query.officialRatings).map((rating) => rating.toLowerCase());
@@ -99,9 +103,11 @@ function queryBridgeItemGroups(
     .filter((item) => !filters.has("isresumable") || Number((item.UserData as Record<string, unknown> | undefined)?.PlaybackPositionTicks ?? 0) > 0)
     .filter((item) => !filters.has("isfolder") || Boolean(item.IsFolder))
     .filter((item) => !filters.has("isnotfolder") || !Boolean(item.IsFolder))
-    .filter((item) => genres.length === 0 || intersects(asStrings(item.Genres), genres))
+    .filter((item) => genres.length === 0 || intersects(genreNames(item), genres))
+    .filter((item) => genreIds.length === 0 || intersects(metadataIds(genreNames(item), "genre"), genreIds))
     .filter((item) => tags.length === 0 || intersects(asStrings(item.Tags), tags))
     .filter((item) => studios.length === 0 || intersects(studioNames(item.Studios), studios))
+    .filter((item) => studioIds.length === 0 || intersects(metadataIds(studioNames(item.Studios), "studio"), studioIds))
     .filter((item) => artists.length === 0 || intersects(asStrings(item.Artists), artists) || intersects(asStrings(item.AlbumArtists), artists) || matchesString(item.AlbumArtist, artists))
     .filter((item) => years.length === 0 || years.includes(Number(item.ProductionYear ?? 0)))
     .filter((item) => officialRatings.length === 0 || matchesString(item.OfficialRating, officialRatings))
@@ -458,6 +464,10 @@ function parseNumberList(value: string | undefined): number[] {
   return parseList(value).map(Number).filter((item) => Number.isInteger(item));
 }
 
+function normalizedMetadataId(value: string): string {
+  return value.replaceAll("-", "").toLowerCase();
+}
+
 function asStrings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
@@ -475,6 +485,17 @@ function matchesString(value: unknown, filters: string[]): boolean {
   return typeof value === "string" && filters.includes(value.toLowerCase());
 }
 
+function genreNames(item: Record<string, unknown>): string[] {
+  return [
+    ...asStrings(item.Genres),
+    ...asRecords(item.GenreItems).map((genre) => genre.Name).filter((name): name is string => typeof name === "string")
+  ];
+}
+
 function studioNames(value: unknown): string[] {
   return [...asStrings(value), ...asRecords(value).map((item) => item.Name).filter((name): name is string => typeof name === "string")];
+}
+
+function metadataIds(names: string[], type: "genre" | "studio"): string[] {
+  return names.map((name) => bridgeItemId(`${type}:${name.toLowerCase()}`).toLowerCase());
 }

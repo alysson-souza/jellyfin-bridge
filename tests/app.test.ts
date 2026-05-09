@@ -3472,6 +3472,142 @@ test("fans out genre and studio browse to upstream Jellyfin sources", async () =
   store.close();
 });
 
+test("filters cached item browse by bridge genre and studio ids from metadata lists", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "movie-lib" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "movie-a",
+    libraryId: "movie-lib",
+    itemType: "Movie",
+    logicalKey: "movie:tmdb:1",
+    json: { Id: "movie-a", Type: "Movie", MediaType: "Video", Name: "Movie A", Genres: ["Drama"], Studios: [{ Name: "Example Studio" }] }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "movie-b",
+    libraryId: "movie-lib",
+    itemType: "Movie",
+    logicalKey: "movie:tmdb:2",
+    json: { Id: "movie-b", Type: "Movie", MediaType: "Video", Name: "Movie B", Genres: ["Comedy"], Studios: [{ Name: "Other Studio" }] }
+  });
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const token = login.json().AccessToken;
+  const parentId = bridgeLibraryId("movies");
+
+  const genres = await app.inject({
+    method: "GET",
+    url: `/Genres?ParentId=${parentId}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  const dramaId = genres.json().Items.find((item: any) => item.Name === "Drama").Id;
+  const genreItems = await app.inject({
+    method: "GET",
+    url: `/Users/${login.json().User.Id}/Items?ParentId=${parentId}&Recursive=true&GenreIds=${dramaId}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(genreItems.statusCode, 200);
+  assert.deepEqual(genreItems.json().Items.map((item: any) => item.Name), ["Movie A"]);
+
+  const studios = await app.inject({
+    method: "GET",
+    url: `/Studios?ParentId=${parentId}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  const studioId = studios.json().Items.find((item: any) => item.Name === "Example Studio").Id;
+  const studioItems = await app.inject({
+    method: "GET",
+    url: `/Users/${login.json().User.Id}/Items?ParentId=${parentId}&Recursive=true&StudioIds=${studioId}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(studioItems.statusCode, 200);
+  assert.deepEqual(studioItems.json().Items.map((item: any) => item.Name), ["Movie A"]);
+
+  await app.close();
+  store.close();
+});
+
+test("rewrites bridge genre and studio ids for scan-free live item browse", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "movies", name: "Movies", collectionType: "movies", sources: [{ server: "main", libraryId: "movie-lib" }] }]
+  };
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/Genres": { Items: [{ Id: "genre-drama", Type: "Genre", Name: "Drama" }], TotalRecordCount: 1 },
+    "main:/Studios": { Items: [{ Id: "studio-example", Type: "Studio", Name: "Example Studio" }], TotalRecordCount: 1 },
+    "main:/Items": (_serverId: string, _path: string, init: any) => {
+      if (init.query.Genres === "Drama") {
+        return {
+          Items: [{ Id: "movie-a", Type: "Movie", MediaType: "Video", Name: "Movie A", Genres: ["Drama"], ParentId: "movie-lib", ProviderIds: { Tmdb: "1" } }],
+          TotalRecordCount: 1
+        };
+      }
+      if (init.query.Studios === "Example Studio") {
+        return {
+          Items: [{ Id: "movie-b", Type: "Movie", MediaType: "Video", Name: "Movie B", Studios: [{ Name: "Example Studio" }], ParentId: "movie-lib", ProviderIds: { Tmdb: "2" } }],
+          TotalRecordCount: 1
+        };
+      }
+      return { Items: [], TotalRecordCount: 0 };
+    }
+  });
+  const store = new Store(":memory:");
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const token = login.json().AccessToken;
+  const parentId = bridgeLibraryId("movies");
+
+  const genres = await app.inject({
+    method: "GET",
+    url: `/Genres?ParentId=${parentId}&UserId=${login.json().User.Id}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  const dramaId = genres.json().Items[0].Id;
+  const genreItems = await app.inject({
+    method: "GET",
+    url: `/Users/${login.json().User.Id}/Items?ParentId=${parentId}&Recursive=true&GenreIds=${dramaId}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(genreItems.statusCode, 200);
+  assert.deepEqual(genreItems.json().Items.map((item: any) => item.Name), ["Movie A"]);
+
+  const studios = await app.inject({
+    method: "GET",
+    url: `/Studios?ParentId=${parentId}&UserId=${login.json().User.Id}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  const studioId = studios.json().Items[0].Id;
+  const studioItems = await app.inject({
+    method: "GET",
+    url: `/Users/${login.json().User.Id}/Items?ParentId=${parentId}&Recursive=true&StudioIds=${studioId}`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(studioItems.statusCode, 200);
+  assert.deepEqual(studioItems.json().Items.map((item: any) => item.Name), ["Movie B"]);
+
+  const itemQueries = upstream.requests
+    .filter((request) => request.path === "/Items")
+    .map((request) => (request.init as any).query);
+  assert.deepEqual(itemQueries.map((query) => [query.GenreIds, query.Genres, query.StudioIds, query.Studios]), [
+    [undefined, "Drama", undefined, undefined],
+    [undefined, undefined, undefined, "Example Studio"]
+  ]);
+
+  await app.close();
+  store.close();
+});
+
 test("falls back to cached genre and studio metadata when upstream metadata fails", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
