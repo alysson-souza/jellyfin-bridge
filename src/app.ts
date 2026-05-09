@@ -1102,11 +1102,49 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
 
   function liveQuerySources(path: string, rawQuery: unknown): LiveSource[] {
     const parentId = parentIdFrom(rawQuery);
+    const seriesSources = liveSourcesForSeries(rawQuery);
+    if (seriesSources) return seriesSources;
     if (parentId) return liveLibrarySources(rawQuery);
     const sources = liveLibrarySources(rawQuery);
     if (path !== "/Shows/NextUp") return sources;
     const tvSources = sources.filter((source) => source.collectionType === "tvshows" || source.collectionType === undefined);
     return tvSources.length > 0 ? tvSources : sources;
+  }
+
+  function liveSourcesForSeries(rawQuery: unknown): LiveSource[] | undefined {
+    const seriesId = seriesIdFrom(rawQuery);
+    if (!seriesId) return undefined;
+    const seriesSources = bridgeItemSources(config, store, seriesId);
+    if (seriesSources.length === 0) return undefined;
+    const allowed = new Set(seriesSources.map(indexedSourceKey));
+    const scoped = liveLibrarySources(rawQuery).filter((source) => source.libraryId && allowed.has(liveSourceKey(source)));
+    if (scoped.length > 0 || parentIdFrom(rawQuery)) return scoped;
+    return seriesSources.map(liveSourceForIndexedItem);
+  }
+
+  function liveSourceForIndexedItem(source: IndexedItemRecord, index: number): LiveSource {
+    const configured = configuredLiveLibrarySources().find((candidate) =>
+      candidate.serverId === source.serverId && candidate.libraryId === source.libraryId
+    );
+    if (configured) return configured;
+    const upstreamLibrary = store.listUpstreamLibraries().find((library) =>
+      library.serverId === source.serverId && library.libraryId === source.libraryId
+    );
+    return {
+      serverId: source.serverId,
+      libraryId: source.libraryId,
+      bridgeLibraryId: passThroughLibraryId(source.serverId, source.libraryId),
+      collectionType: upstreamLibrary?.collectionType,
+      priority: liveSourcePriority(source.serverId, index)
+    };
+  }
+
+  function liveSourceKey(source: LiveSource): string {
+    return `${source.serverId}:${source.libraryId ?? ""}`;
+  }
+
+  function indexedSourceKey(source: IndexedItemRecord): string {
+    return `${source.serverId}:${source.libraryId}`;
   }
 
   function liveUpstreamSources(): LiveSource[] {
@@ -1186,7 +1224,9 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   function rewriteSeriesIdForSource(query: LiveQueryParams, rawQuery: unknown, source: LiveSource): void {
     const seriesId = seriesIdFrom(rawQuery);
     if (!seriesId) return;
-    const mapped = bridgeItemSources(config, store, seriesId).find((candidate) => candidate.serverId === source.serverId);
+    const mapped = bridgeItemSources(config, store, seriesId).find((candidate) =>
+      candidate.serverId === source.serverId && (!source.libraryId || candidate.libraryId === source.libraryId)
+    );
     if (!mapped) return;
     delete query.seriesId;
     query.SeriesId = mapped.itemId;

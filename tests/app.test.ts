@@ -4849,6 +4849,95 @@ test("live next-up preserves existing indexed episode identity when upstream omi
   store.close();
 });
 
+test("live next-up scopes series queries to the indexed series library", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [
+      { id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] },
+      { id: "anime", name: "Anime", collectionType: "tvshows", sources: [{ server: "main", libraryId: "anime-lib" }] }
+    ]
+  };
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/Shows/NextUp": {
+      Items: [{
+        Id: "episode-a",
+        Type: "Episode",
+        Name: "Pilot",
+        SeriesId: "series-a",
+        SeasonId: "season-a",
+        ParentIndexNumber: 1,
+        IndexNumber: 1
+      }],
+      TotalRecordCount: 1,
+      StartIndex: 0
+    }
+  });
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "anime-lib",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "series-a", Type: "Series", Name: "Example Series", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-a",
+    libraryId: "anime-lib",
+    itemType: "Season",
+    logicalKey: "season:series:series-a:season:1",
+    json: { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "episode-a",
+    libraryId: "anime-lib",
+    itemType: "Episode",
+    logicalKey: "episode:series:series-a:season:1:episode:1",
+    json: {
+      Id: "episode-a",
+      Type: "Episode",
+      Name: "Pilot",
+      ParentId: "season-a",
+      SeriesId: "series-a",
+      SeasonId: "season-a",
+      ParentIndexNumber: 1,
+      IndexNumber: 1
+    }
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const seriesId = bridgeItemId("series:tvdb:100");
+  const seasonId = bridgeItemId("season:series:series-a:season:1");
+
+  const nextUp = await app.inject({
+    method: "GET",
+    url: `/Shows/NextUp?userId=${login.json().User.Id}&SeriesId=${seriesId}&Limit=1`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+  const episodes = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Episodes?userId=${login.json().User.Id}&SeasonId=${seasonId}&Limit=50`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(nextUp.statusCode, 200);
+  assert.deepEqual(upstream.requests
+    .filter((request) => request.path === "/Shows/NextUp")
+    .map((request) => (request.init as any).query.ParentId), ["anime-lib"]);
+  assert.equal(store.findIndexedItemsBySourceId("episode-a")[0]?.libraryId, "anime-lib");
+  assert.equal(episodes.statusCode, 200);
+  assert.deepEqual(episodes.json().Items.map((item: any) => item.Name), ["Pilot"]);
+
+  await app.close();
+  store.close();
+});
+
 test("maps item-scoped live resume parent ids without broadening to the library", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
