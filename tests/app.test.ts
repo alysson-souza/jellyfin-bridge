@@ -3656,6 +3656,19 @@ test("resolves PlaybackInfo through the priority upstream source and stores medi
   assert.equal(extensionlessStream.headers["content-type"], "video/x-matroska");
   assert.equal(extensionlessStream.body, "data");
 
+  upstream.rawResponses["main:/Videos/main-alien/stream"] = {
+    statusCode: 200,
+    headers: { "content-type": "video/x-matroska", "content-length": "4" },
+    body: Readable.from(Buffer.from("data"))
+  };
+  const lowercaseStream = await app.inject({
+    method: "GET",
+    url: `/videos/${itemId}/stream?MediaSourceId=${playback.json().MediaSources[0].Id}&Static=true`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(lowercaseStream.statusCode, 200);
+  assert.equal(lowercaseStream.body, "data");
+
   const detailMediaSourceId = bridgeMediaSourceId("main", itemId, "source-main");
   upstream.rawResponses["main:/Videos/main-alien/stream"] = {
     statusCode: 206,
@@ -4595,6 +4608,15 @@ test("cached show episode routes keep regular seasons in episode order", async (
 
   assert.equal(episodes.statusCode, 200);
   assert.deepEqual(episodes.json().Items.map((item: any) => item.Name), ["Zeta Pilot", "Alpha Follow-up", "Middle Finale"]);
+
+  const childItems = await app.inject({
+    method: "GET",
+    url: `/Items?ParentId=${seasonId}&StartIndex=0&Limit=50`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(childItems.statusCode, 200);
+  assert.deepEqual(childItems.json().Items.map((item: any) => item.Name), ["Zeta Pilot", "Alpha Follow-up", "Middle Finale"]);
 
   await app.close();
   store.close();

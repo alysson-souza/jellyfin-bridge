@@ -387,12 +387,48 @@ function sourcePriorities(config: BridgeConfig): Map<string, number> {
 }
 
 function compareItems(query: BrowseQuery): (left: Record<string, unknown>, right: Record<string, unknown>) => number {
-  const sortBy = parseList(query.sortBy)[0]?.toLowerCase() ?? "sortname";
+  const requestedSortBy = parseList(query.sortBy)[0]?.toLowerCase();
+  const sortBy = requestedSortBy ?? "sortname";
   const descending = parseList(query.sortOrder)[0]?.toLowerCase() === "descending";
   return (left, right) => {
-    const result = compareValue(sortValue(left, sortBy), sortValue(right, sortBy));
+    const result = requestedSortBy
+      ? compareValue(sortValue(left, sortBy), sortValue(right, sortBy))
+      : compareDefaultValue(left, right);
     return descending ? -result : result;
   };
+}
+
+function compareDefaultValue(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  const episodeOrder = compareEpisodeOrder(left, right);
+  if (episodeOrder !== undefined && episodeOrder !== 0) return episodeOrder;
+  return compareValue(sortValue(left, "sortname"), sortValue(right, "sortname"));
+}
+
+function compareEpisodeOrder(left: Record<string, unknown>, right: Record<string, unknown>): number | undefined {
+  if (String(left.Type ?? "").toLowerCase() !== "episode" || String(right.Type ?? "").toLowerCase() !== "episode") {
+    return undefined;
+  }
+  const season = compareOptionalNumber(left.ParentIndexNumber, right.ParentIndexNumber);
+  if (season !== 0) return season;
+  return compareOptionalNumber(left.IndexNumber, right.IndexNumber);
+}
+
+function compareOptionalNumber(left: unknown, right: unknown): number {
+  const leftNumber = numericSortValue(left);
+  const rightNumber = numericSortValue(right);
+  if (leftNumber === undefined && rightNumber === undefined) return 0;
+  if (leftNumber === undefined) return 1;
+  if (rightNumber === undefined) return -1;
+  return leftNumber - rightNumber;
+}
+
+function numericSortValue(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim() !== "") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
 }
 
 function sortValue(item: Record<string, unknown>, sortBy: string): unknown {

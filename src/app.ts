@@ -813,9 +813,13 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return queryResult([]);
   });
   app.get("/Videos/:itemId/stream", async (request, reply) => proxyProgressiveStream("Videos", request, reply));
+  app.get("/videos/:itemId/stream", async (request, reply) => proxyProgressiveStream("Videos", request, reply));
   app.get("/Audio/:itemId/stream", async (request, reply) => proxyProgressiveStream("Audio", request, reply));
+  app.get("/audio/:itemId/stream", async (request, reply) => proxyProgressiveStream("Audio", request, reply));
   app.get("/Videos/:itemId/stream.:container", async (request, reply) => proxyProgressiveStream("Videos", request, reply));
+  app.get("/videos/:itemId/stream.:container", async (request, reply) => proxyProgressiveStream("Videos", request, reply));
   app.get("/Audio/:itemId/stream.:container", async (request, reply) => proxyProgressiveStream("Audio", request, reply));
+  app.get("/audio/:itemId/stream.:container", async (request, reply) => proxyProgressiveStream("Audio", request, reply));
   app.get("/Videos/:itemId/:playlist.m3u8", async (request, reply) => proxyHlsPlaylist("Videos", request, reply));
   app.get("/Audio/:itemId/:playlist.m3u8", async (request, reply) => proxyHlsPlaylist("Audio", request, reply));
   app.get("/Videos/:itemId/hls1/:playlistId/:segmentId.:container", async (request, reply) => proxyHlsSegment("Videos", "hls1", request, reply));
