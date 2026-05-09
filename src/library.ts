@@ -43,7 +43,7 @@ export function listBridgeItems(config: BridgeConfig, store: Store, userId: stri
 
 export function queryBridgeItems(config: BridgeConfig, store: Store, userId: string, query: BrowseQuery = {}): BridgeItemsResult {
   const includeTypes = parseList(query.includeItemTypes);
-  return queryBridgeItemGroups(config, store, userId, indexedItemGroupsForParent(config, store, query.parentId, query.recursive, includeTypes), query);
+  return queryBridgeItemGroups(config, store, userId, indexedItemGroupsForParent(config, store, query.parentId, query.recursive, includeTypes, query.searchTerm), query);
 }
 
 export function queryBridgeItemsFromIndexedItems(
@@ -139,27 +139,27 @@ function completeSourceGroups(store: Store, items: IndexedItemRecord[], inScope:
   });
 }
 
-function indexedItemGroupsForParent(config: BridgeConfig, store: Store, parentId: string | undefined, recursive = false, itemTypes: string[] = []): IndexedItemRecord[][] {
-  if (!parentId) return groupsFromCandidateItems(store, store.listIndexedItems(itemTypes), itemTypes);
+function indexedItemGroupsForParent(config: BridgeConfig, store: Store, parentId: string | undefined, recursive = false, itemTypes: string[] = [], searchTerm?: string): IndexedItemRecord[][] {
+  if (!parentId) return groupsFromCandidateItems(store, store.listIndexedItems(itemTypes, searchTerm), itemTypes);
   const configuredLibrary = config.libraries.find((library) => bridgeLibraryId(library.id) === parentId);
   if (configuredLibrary) {
     const sources = configuredLibrary.sources.map((source) => ({
       serverId: source.server,
       libraryId: source.libraryId
     }));
-    const items = store.listIndexedItemsForSources(sources, recursive ? itemTypes : []);
+    const items = store.listIndexedItemsForSources(sources, recursive ? itemTypes : [], searchTerm);
     return groupsFromCandidateItems(store, recursive ? items : directLibraryChildren(items, sources), recursive ? itemTypes : [], sourceScope(sources));
   }
   const passThroughLibrary = store.listUpstreamLibraries().find((library) => passThroughLibraryId(library.serverId, library.libraryId) === parentId);
   if (passThroughLibrary) {
     const sources = [{ serverId: passThroughLibrary.serverId, libraryId: passThroughLibrary.libraryId }];
-    const items = store.listIndexedItemsForSources(sources, recursive ? itemTypes : []);
+    const items = store.listIndexedItemsForSources(sources, recursive ? itemTypes : [], searchTerm);
     return groupsFromCandidateItems(store, recursive ? items : directLibraryChildren(items, sources), recursive ? itemTypes : [], sourceScope(sources));
   }
 
   const parentSources = store.findIndexedItemsByBridgeId(parentId);
   if (parentSources.length === 0) return [];
-  return groupsFromCandidateItems(store, store.listIndexedChildItems(parentSources, itemTypes), itemTypes, childScope(parentSources));
+  return groupsFromCandidateItems(store, store.listIndexedChildItems(parentSources, itemTypes, searchTerm), itemTypes, childScope(parentSources));
 }
 
 function groupsFromCandidateItems(

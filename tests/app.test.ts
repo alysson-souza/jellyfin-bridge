@@ -2052,7 +2052,7 @@ test("paged cached item browse reads the indexed catalog once on cache hits", as
   store.close();
 });
 
-test("recursive item browse pushes include item types into the indexed catalog read", async () => {
+test("recursive item browse pushes include item types and search term into the indexed catalog read", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
     server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
@@ -2077,25 +2077,28 @@ test("recursive item browse pushes include item types into the indexed catalog r
     logicalKey: "series:tvdb:200",
     json: { Id: "series-a", Type: "Series", Name: "Series A", ProviderIds: { Tvdb: "200" } }
   });
-  type InstrumentedStore = Store & { listIndexedItems: (itemTypes?: string[]) => ReturnType<Store["listIndexedItems"]> };
+  type InstrumentedStore = Store & { listIndexedItems: (itemTypes?: string[], searchTerm?: string) => ReturnType<Store["listIndexedItems"]> };
   const instrumented = store as InstrumentedStore;
   const originalListIndexedItems = instrumented.listIndexedItems.bind(store);
   let requestedItemTypes: string[] = [];
-  instrumented.listIndexedItems = (itemTypes = []) => {
+  let requestedSearchTerm: string | undefined;
+  instrumented.listIndexedItems = (itemTypes = [], searchTerm) => {
     requestedItemTypes = itemTypes;
-    return originalListIndexedItems(itemTypes);
+    requestedSearchTerm = searchTerm;
+    return originalListIndexedItems(itemTypes, searchTerm);
   };
   const app = buildApp({ config, store });
   const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
 
   const response = await app.inject({
     method: "GET",
-    url: "/Items?Recursive=true&includeItemTypes=movie",
+    url: "/Items?Recursive=true&includeItemTypes=movie&SearchTerm=Movie",
     headers: { "X-MediaBrowser-Token": login.json().AccessToken }
   });
 
   assert.equal(response.statusCode, 200);
   assert.deepEqual(requestedItemTypes.map((type) => type.toLowerCase()), ["movie"]);
+  assert.equal(requestedSearchTerm, "Movie");
   assert.deepEqual(response.json().Items.map((item: any) => item.Name), ["Movie A"]);
 
   await app.close();

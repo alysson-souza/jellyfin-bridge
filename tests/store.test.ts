@@ -52,6 +52,34 @@ test("migrates indexed items from the legacy schema without bridge item ids", ()
   }
 });
 
+test("filters indexed item reads by search term before JSON hydration", () => {
+  const store = new Store(":memory:");
+  try {
+    store.upsertIndexedItem({
+      serverId: "main",
+      itemId: "movie-a",
+      libraryId: "library-a",
+      itemType: "Movie",
+      logicalKey: "movie:tmdb:1",
+      json: { Id: "movie-a", Type: "Movie", Name: "The Mighty Nein" }
+    });
+    store.upsertIndexedItem({
+      serverId: "main",
+      itemId: "movie-b",
+      libraryId: "library-a",
+      itemType: "Movie",
+      logicalKey: "movie:tmdb:2",
+      json: { Id: "movie-b", Type: "Movie", Name: "Something Else" }
+    });
+
+    const items = store.listIndexedItems(["Movie"], "nein");
+
+    assert.deepEqual(items.map((item) => item.itemId), ["movie-a"]);
+  } finally {
+    store.close();
+  }
+});
+
 test("replaces InfuseSync checkpoints with the previous sync timestamp as the next from timestamp", () => {
   const store = new Store(":memory:");
   try {

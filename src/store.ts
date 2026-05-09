@@ -280,15 +280,20 @@ export class Store {
     this.db.prepare(`DELETE FROM indexed_items WHERE server_id = ? AND library_id = ? AND item_id NOT IN (${placeholders})`).run(serverId, libraryId, ...itemIds);
   }
 
-  listIndexedItems(itemTypes: string[] = []): IndexedItemRecord[] {
+  listIndexedItems(itemTypes: string[] = [], searchTerm?: string): IndexedItemRecord[] {
     const normalizedTypes = normalizeItemTypes(itemTypes);
+    const search = indexedItemSearch(searchTerm);
     const rows = normalizedTypes.length === 0
-      ? this.db.prepare("SELECT * FROM indexed_items ORDER BY server_id, library_id, item_id").all() as Row[]
+      ? this.db.prepare(`
+        SELECT * FROM indexed_items
+        WHERE 1 = 1${search.clause}
+        ORDER BY server_id, library_id, item_id
+      `).all(...search.values) as Row[]
       : this.db.prepare(`
         SELECT * FROM indexed_items
-        WHERE lower(item_type) IN (${placeholders(normalizedTypes)})
+        WHERE lower(item_type) IN (${placeholders(normalizedTypes)})${search.clause}
         ORDER BY server_id, library_id, item_id
-      `).all(...normalizedTypes) as Row[];
+      `).all(...normalizedTypes, ...search.values) as Row[];
     return rows.map(indexedItemRecordFromRow);
   }
 
@@ -303,33 +308,35 @@ export class Store {
     return rows.map(indexedItemRecordFromRow);
   }
 
-  listIndexedItemsForSources(sources: Array<{ serverId: string; libraryId: string }>, itemTypes: string[] = []): IndexedItemRecord[] {
+  listIndexedItemsForSources(sources: Array<{ serverId: string; libraryId: string }>, itemTypes: string[] = [], searchTerm?: string): IndexedItemRecord[] {
     if (sources.length === 0) return [];
     const conditions = sources.map(() => "(server_id = ? AND library_id = ?)").join(" OR ");
     const values = sources.flatMap((source) => [source.serverId, source.libraryId]);
     const normalizedTypes = normalizeItemTypes(itemTypes);
     const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(item_type) IN (${placeholders(normalizedTypes)})`;
+    const search = indexedItemSearch(searchTerm);
     const rows = this.db.prepare(`
       SELECT * FROM indexed_items
-      WHERE (${conditions})${typeClause}
+      WHERE (${conditions})${typeClause}${search.clause}
       ORDER BY server_id, library_id, item_id
-    `).all(...values, ...normalizedTypes) as Row[];
+    `).all(...values, ...normalizedTypes, ...search.values) as Row[];
     return rows.map(indexedItemRecordFromRow);
   }
 
-  listIndexedChildItems(parentSources: IndexedItemParentRef[], itemTypes: string[] = []): IndexedItemRecord[] {
+  listIndexedChildItems(parentSources: IndexedItemParentRef[], itemTypes: string[] = [], searchTerm?: string): IndexedItemRecord[] {
     if (parentSources.length === 0) return [];
     const normalizedTypes = normalizeItemTypes(itemTypes);
     const typeClause = normalizedTypes.length === 0 ? "" : ` AND lower(item_type) IN (${placeholders(normalizedTypes)})`;
+    const search = indexedItemSearch(searchTerm);
     const subqueries: string[] = [];
     const values: string[] = [];
     for (const source of parentSources) {
       for (const field of ["ParentId", "SeriesId", "SeasonId"]) {
         subqueries.push(`
           SELECT * FROM indexed_items
-          WHERE server_id = ? AND library_id = ?${typeClause} AND json_extract(json, '$.${field}') = ?
+          WHERE server_id = ? AND library_id = ?${typeClause}${search.clause} AND json_extract(json, '$.${field}') = ?
         `);
-        values.push(source.serverId, source.libraryId, ...normalizedTypes, source.itemId);
+        values.push(source.serverId, source.libraryId, ...normalizedTypes, ...search.values, source.itemId);
       }
     }
     const rows = this.db.prepare(`
@@ -778,6 +785,21 @@ function userDataFromRow(row: Row): UserDataRecord {
 
 function normalizeItemTypes(itemTypes: string[]): string[] {
   return uniqueStrings(itemTypes.map((itemType) => itemType.trim().toLowerCase()).filter(Boolean));
+}
+
+function indexedItemSearch(searchTerm: string | undefined): { clause: string; values: string[] } {
+  const normalized = searchTerm?.trim().toLowerCase();
+  if (!normalized) return { clause: "", values: [] };
+  return {
+    clause: `
+      AND (
+        instr(lower(COALESCE(json_extract(json, '$.Name'), '')), ?) > 0
+        OR instr(lower(COALESCE(json_extract(json, '$.OriginalTitle'), '')), ?) > 0
+        OR instr(lower(COALESCE(json_extract(json, '$.SortName'), '')), ?) > 0
+      )
+    `,
+    values: [normalized, normalized, normalized]
+  };
 }
 
 function uniqueStrings(values: string[]): string[] {
