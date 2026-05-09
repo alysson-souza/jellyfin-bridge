@@ -1428,7 +1428,7 @@ test("forwards watched playstate writes to every logical upstream source", async
   store.close();
 });
 
-test("forwards generic watched user data writes and keeps non-watched writes local", async () => {
+test("forwards watched and favorite user data writes and keeps position-only writes local", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
     server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
@@ -1495,14 +1495,14 @@ test("forwards generic watched user data writes and keeps non-watched writes loc
       path: "/UserItems/main-alien/UserData",
       method: "POST",
       query: { userId: "main-user" },
-      body: { Played: true, PlaybackPositionTicks: 1234, LastPlayedDate: lastPlayedDate }
+      body: { Played: true, IsFavorite: true, PlaybackPositionTicks: 1234, LastPlayedDate: lastPlayedDate }
     },
     {
       serverId: "remote",
       path: "/UserItems/remote-alien/UserData",
       method: "POST",
       query: { userId: "remote-user" },
-      body: { Played: true, PlaybackPositionTicks: 1234, LastPlayedDate: lastPlayedDate }
+      body: { Played: true, IsFavorite: true, PlaybackPositionTicks: 1234, LastPlayedDate: lastPlayedDate }
     }
   ]);
 
@@ -1525,7 +1525,66 @@ test("forwards generic watched user data writes and keeps non-watched writes loc
   });
   assert.equal(favoriteOnly.statusCode, 200);
   assert.equal(favoriteOnly.json().IsFavorite, false);
-  assert.equal(upstream.requests.length, upstreamRequestCount);
+  assert.deepEqual(upstream.requests.slice(upstreamRequestCount).filter((request) => request.path.includes("/UserData")).map((request) => {
+    const init = request.init as any;
+    return {
+      serverId: request.serverId,
+      path: request.path,
+      method: init.method,
+      query: init.query,
+      body: init.body
+    };
+  }).sort((left, right) => left.serverId.localeCompare(right.serverId)), [
+    {
+      serverId: "main",
+      path: "/UserItems/main-alien/UserData",
+      method: "POST",
+      query: { userId: "main-user" },
+      body: { IsFavorite: false }
+    },
+    {
+      serverId: "remote",
+      path: "/UserItems/remote-alien/UserData",
+      method: "POST",
+      query: { userId: "remote-user" },
+      body: { IsFavorite: false }
+    }
+  ]);
+
+  const favoriteRequestCount = upstream.requests.length;
+  const legacyFavorite = await app.inject({
+    method: "POST",
+    url: `/Users/${userId}/FavoriteItems/${alienBridgeId}`,
+    headers: { "X-MediaBrowser-Token": token, "content-type": "application/json" },
+    payload: ""
+  });
+  assert.equal(legacyFavorite.statusCode, 200);
+  assert.equal(legacyFavorite.json().IsFavorite, true);
+  assert.deepEqual(upstream.requests.slice(favoriteRequestCount).filter((request) => request.path.includes("/UserData")).map((request) => {
+    const init = request.init as any;
+    return {
+      serverId: request.serverId,
+      path: request.path,
+      method: init.method,
+      query: init.query,
+      body: init.body
+    };
+  }).sort((left, right) => left.serverId.localeCompare(right.serverId)), [
+    {
+      serverId: "main",
+      path: "/UserItems/main-alien/UserData",
+      method: "POST",
+      query: { userId: "main-user" },
+      body: { IsFavorite: true }
+    },
+    {
+      serverId: "remote",
+      path: "/UserItems/remote-alien/UserData",
+      method: "POST",
+      query: { userId: "remote-user" },
+      body: { IsFavorite: true }
+    }
+  ]);
 
   await app.close();
   store.close();
@@ -1661,8 +1720,8 @@ test("does not mutate local watched state when upstream propagation cannot compl
       const init = request.init as any;
       return { serverId: request.serverId, path: request.path, body: init.body };
     }), [
-    { serverId: "main", path: "/UserItems/main-alien/UserData", body: { Played: true, PlaybackPositionTicks: 1111 } },
-    { serverId: "remote", path: "/UserItems/remote-alien/UserData", body: { Played: true, PlaybackPositionTicks: 1111 } }
+    { serverId: "main", path: "/UserItems/main-alien/UserData", body: { Played: true, IsFavorite: true, PlaybackPositionTicks: 1111 } },
+    { serverId: "remote", path: "/UserItems/remote-alien/UserData", body: { Played: true, IsFavorite: true, PlaybackPositionTicks: 1111 } }
   ]);
   await userDataFailureApp.close();
   userDataFailureStore.close();
@@ -2214,6 +2273,8 @@ test("serves indexed items as merged bridge items", async () => {
   const playstateUpstream = new FakeUpstream({
     "main:/Users": [{ Id: "main-user", Name: "alice" }],
     "remote:/Users": [{ Id: "remote-user", Name: "alice" }],
+    "main:/UserItems/main-alien/UserData": { IsFavorite: true },
+    "remote:/UserItems/remote-alien/UserData": { IsFavorite: true },
     "main:/UserPlayedItems/main-alien": { Played: true },
     "remote:/UserPlayedItems/remote-alien": { Played: true }
   });

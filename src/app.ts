@@ -48,12 +48,12 @@ interface RawProxyCandidate {
   path: string;
 }
 
-interface WatchedWriteTarget {
+interface UserDataWriteTarget {
   bridgeItemId: string;
   sources: IndexedItemRecord[];
 }
 
-type WatchedUserDataPayload = Record<string, boolean | number | string>;
+type UpstreamUserDataPayload = Record<string, boolean | number | string>;
 
 const LIVE_BROWSE_FIELDS = [
   "BasicSyncInfo",
@@ -92,7 +92,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     logger: process.env.JELLYFIN_BRIDGE_LOG_REQUESTS === "1",
     rewriteUrl: (request) => stripEmbyBasePath(request.url ?? "/")
   });
-  allowEmptyJsonDeleteBodies(app);
+  allowEmptyJsonBodiesForNoBodyRoutes(app);
   let serverId = bridgeServerId(config.server.name);
   let configVersion = 0;
   const liveUserCache = new Map<string, { expiresAt: number; promise: Promise<string | undefined> }>();
@@ -683,11 +683,11 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
     const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
-    const watchedPayload = watchedUserDataPayload(request.body);
-    if (watchedPayload) {
-      const target = resolveWatchedWriteTarget(itemId);
+    const upstreamPayload = upstreamUserDataPayload(request.body);
+    if (upstreamPayload) {
+      const target = resolveUserDataWriteTarget(itemId);
       if (!target) return notFound(reply, "Item not found");
-      await forwardWatchedUserData(target.sources, auth.user.name, watchedPayload);
+      await forwardUserData(target.sources, auth.user.name, upstreamPayload);
       saveUserData(store, userIdValue, target.bridgeItemId, request.body);
       return userDataDto(store, userIdValue, target.bridgeItemId);
     }
@@ -700,11 +700,11 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    const watchedPayload = watchedUserDataPayload(request.body);
-    if (watchedPayload) {
-      const target = resolveWatchedWriteTarget(itemId);
+    const upstreamPayload = upstreamUserDataPayload(request.body);
+    if (upstreamPayload) {
+      const target = resolveUserDataWriteTarget(itemId);
       if (!target) return notFound(reply, "Item not found");
-      await forwardWatchedUserData(target.sources, auth.user.name, watchedPayload);
+      await forwardUserData(target.sources, auth.user.name, upstreamPayload);
       saveUserData(store, userIdValue, target.bridgeItemId, request.body);
       return userDataDto(store, userIdValue, target.bridgeItemId);
     }
@@ -716,38 +716,44 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.post("/UserFavoriteItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
-    if (!canWriteUserData(auth.session.userId, itemId)) return notFound(reply, "Item not found");
-    return setFavorite(auth.session.userId, itemId, true);
+    const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
+    const data = await setFavorite(userIdValue, itemId, auth.user.name, true);
+    if (!data) return notFound(reply, "Item not found");
+    return data;
   });
 
   app.delete("/UserFavoriteItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
-    if (!canWriteUserData(auth.session.userId, itemId)) return notFound(reply, "Item not found");
-    return setFavorite(auth.session.userId, itemId, false);
+    const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
+    const data = await setFavorite(userIdValue, itemId, auth.user.name, false);
+    if (!data) return notFound(reply, "Item not found");
+    return data;
   });
 
   app.post("/Users/:userId/FavoriteItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    if (!canWriteUserData(userIdValue, itemId)) return notFound(reply, "Item not found");
-    return setFavorite(userIdValue, itemId, true);
+    const data = await setFavorite(userIdValue, itemId, auth.user.name, true);
+    if (!data) return notFound(reply, "Item not found");
+    return data;
   });
 
   app.delete("/Users/:userId/FavoriteItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    if (!canWriteUserData(userIdValue, itemId)) return notFound(reply, "Item not found");
-    return setFavorite(userIdValue, itemId, false);
+    const data = await setFavorite(userIdValue, itemId, auth.user.name, false);
+    if (!data) return notFound(reply, "Item not found");
+    return data;
   });
 
   app.post("/UserPlayedItems/:itemId", async (request, reply) => {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
     const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
-    const target = resolveWatchedWriteTarget(itemId);
+    const target = resolveUserDataWriteTarget(itemId);
     if (!target) return notFound(reply, "Item not found");
     const datePlayed = datePlayedFromQuery(request.query);
     await forwardPlayedState(target.sources, auth.user.name, true, datePlayed);
@@ -758,7 +764,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const auth = requireSession(request, config, store);
     const { itemId } = request.params as { itemId: string };
     const userIdValue = requireSelf(auth, userIdFromQuery(request.query));
-    const target = resolveWatchedWriteTarget(itemId);
+    const target = resolveUserDataWriteTarget(itemId);
     if (!target) return notFound(reply, "Item not found");
     await forwardPlayedState(target.sources, auth.user.name, false);
     return setPlayed(userIdValue, target.bridgeItemId, false);
@@ -768,7 +774,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    const target = resolveWatchedWriteTarget(itemId);
+    const target = resolveUserDataWriteTarget(itemId);
     if (!target) return notFound(reply, "Item not found");
     const datePlayed = datePlayedFromQuery(request.query);
     await forwardPlayedState(target.sources, auth.user.name, true, datePlayed);
@@ -779,7 +785,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const auth = requireSession(request, config, store);
     const { userId: routeUserId, itemId } = request.params as { userId: string; itemId: string };
     const userIdValue = requireSelf(auth, routeUserId);
-    const target = resolveWatchedWriteTarget(itemId);
+    const target = resolveUserDataWriteTarget(itemId);
     if (!target) return notFound(reply, "Item not found");
     await forwardPlayedState(target.sources, auth.user.name, false);
     return setPlayed(userIdValue, target.bridgeItemId, false);
@@ -2356,12 +2362,20 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     return queryResult(result.items, query.startIndex ?? 0, result.total);
   }
 
-  function setFavorite(userIdValue: string, itemId: string, isFavorite: boolean): Record<string, unknown> {
+  async function setFavorite(userIdValue: string, itemId: string, userName: string, isFavorite: boolean): Promise<Record<string, unknown> | undefined> {
+    const target = resolveUserDataWriteTarget(itemId);
+    if (target) {
+      await forwardUserData(target.sources, userName, { IsFavorite: isFavorite });
+      store.upsertUserData(userIdValue, target.bridgeItemId, { isFavorite });
+      return userDataDto(store, userIdValue, target.bridgeItemId);
+    }
+
+    if (!canWriteUserData(userIdValue, itemId)) return undefined;
     store.upsertUserData(userIdValue, itemId, { isFavorite });
     return userDataDto(store, userIdValue, itemId);
   }
 
-  function resolveWatchedWriteTarget(itemIdValue: string): WatchedWriteTarget | undefined {
+  function resolveUserDataWriteTarget(itemIdValue: string): UserDataWriteTarget | undefined {
     const bridgeSources = bridgeItemSources(config, store, itemIdValue);
     if (bridgeSources.length > 0) {
       return { bridgeItemId: itemIdValue, sources: bridgeSources };
@@ -2391,7 +2405,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
   }
 
-  async function forwardWatchedUserData(sources: IndexedItemRecord[], userName: string, payload: WatchedUserDataPayload): Promise<void> {
+  async function forwardUserData(sources: IndexedItemRecord[], userName: string, payload: UpstreamUserDataPayload): Promise<void> {
     const userIds = new Map<string, string>();
     for (const source of sources) {
       const upstreamUserId = await exactUpstreamUserIdForWrite(source.serverId, userName, userIds);
@@ -2403,7 +2417,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         });
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        throw badGatewayError(`Upstream watched user data write failed: ${detail}`);
+        throw badGatewayError(`Upstream user data write failed: ${detail}`);
       }
     }
   }
@@ -3320,17 +3334,25 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   }
 }
 
-function allowEmptyJsonDeleteBodies(app: FastifyInstance): void {
+function allowEmptyJsonBodiesForNoBodyRoutes(app: FastifyInstance): void {
   const defaultJsonParser = app.getDefaultJsonParser("error", "error");
   app.removeContentTypeParser("application/json");
   app.addContentTypeParser<string>("application/json", { parseAs: "string" }, (request, body, done) => {
-    if (request.method === "DELETE" && body.length === 0) {
+    if (body.length === 0 && acceptsEmptyJsonBody(request.method, request.url)) {
       done(null, undefined);
       return;
     }
 
     defaultJsonParser(request, body, done);
   });
+}
+
+function acceptsEmptyJsonBody(method: string, url: string | undefined): boolean {
+  if (method === "DELETE") return true;
+  if (method !== "POST") return false;
+  const path = (url ?? "").split("?", 1)[0];
+  return /^\/User(?:Favorite|Played)Items\/[^/]+$/.test(path)
+    || /^\/Users\/[^/]+\/(?:Favorite|Played)Items\/[^/]+$/.test(path);
 }
 
 function toRuntimeConfigSource(config: BridgeConfig | RuntimeConfigSource): RuntimeConfigSource {
@@ -3468,15 +3490,17 @@ function saveUserData(store: Store, userIdValue: string, itemId: string, body: u
   });
 }
 
-function watchedUserDataPayload(body: unknown): WatchedUserDataPayload | undefined {
+function upstreamUserDataPayload(body: unknown): UpstreamUserDataPayload | undefined {
   if (!isRecord(body)) return undefined;
-  const triggersWatchedWrite = typeof body.Played === "boolean"
+  const triggersUpstreamWrite = typeof body.Played === "boolean"
+    || typeof body.IsFavorite === "boolean"
     || typeof body.PlayCount === "number"
     || typeof body.LastPlayedDate === "string";
-  if (!triggersWatchedWrite) return undefined;
+  if (!triggersUpstreamWrite) return undefined;
 
-  const payload: WatchedUserDataPayload = {};
+  const payload: UpstreamUserDataPayload = {};
   if (typeof body.Played === "boolean") payload.Played = body.Played;
+  if (typeof body.IsFavorite === "boolean") payload.IsFavorite = body.IsFavorite;
   if (typeof body.PlayCount === "number") payload.PlayCount = body.PlayCount;
   if (typeof body.LastPlayedDate === "string") payload.LastPlayedDate = body.LastPlayedDate;
   if (typeof body.PlaybackPositionTicks === "number") payload.PlaybackPositionTicks = body.PlaybackPositionTicks;
