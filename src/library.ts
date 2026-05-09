@@ -6,6 +6,7 @@ import type { IndexedItemParentRef, IndexedItemRecord, Store } from "./store.js"
 export interface BrowseQuery {
   includeItemTypes?: string;
   mediaTypes?: string;
+  searchTerm?: string;
   parentId?: string;
   recursive?: boolean;
   genres?: string;
@@ -80,6 +81,7 @@ function queryBridgeItemGroups(
 ): BridgeItemsResult {
   const includeTypes = parseList(query.includeItemTypes).map((type) => type.toLowerCase());
   const mediaTypes = parseList(query.mediaTypes).map((type) => type.toLowerCase());
+  const searchTerm = query.searchTerm?.trim().toLowerCase();
   const genres = parseFilterList(query.genres).map((genre) => genre.toLowerCase());
   const genreIds = parseFilterList(query.genreIds).map(normalizedMetadataId);
   const tags = parseFilterList(query.tags).map((tag) => tag.toLowerCase());
@@ -95,6 +97,7 @@ function queryBridgeItemGroups(
     .map((sources) => toBridgeItem(config, store, userId, sources, context))
     .filter((item) => includeTypes.length === 0 || includeTypes.includes(String(item.Type ?? "").toLowerCase()))
     .filter((item) => mediaTypes.length === 0 || mediaTypes.includes(String(item.MediaType ?? "").toLowerCase()))
+    .filter((item) => !searchTerm || itemMatchesSearchTerm(item, searchTerm))
     .filter((item) => query.isFavorite === undefined || Boolean((item.UserData as Record<string, unknown> | undefined)?.IsFavorite) === query.isFavorite)
     .filter((item) => query.isPlayed === undefined || Boolean((item.UserData as Record<string, unknown> | undefined)?.Played) === query.isPlayed)
     .filter((item) => !filters.has("isfavorite") || Boolean((item.UserData as Record<string, unknown> | undefined)?.IsFavorite))
@@ -483,6 +486,11 @@ function intersects(values: string[], filters: string[]): boolean {
 
 function matchesString(value: unknown, filters: string[]): boolean {
   return typeof value === "string" && filters.includes(value.toLowerCase());
+}
+
+function itemMatchesSearchTerm(item: Record<string, unknown>, searchTerm: string): boolean {
+  return [item.Name, item.OriginalTitle, item.SortName]
+    .some((value) => typeof value === "string" && value.toLowerCase().includes(searchTerm));
 }
 
 function genreNames(item: Record<string, unknown>): string[] {

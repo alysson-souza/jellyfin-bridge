@@ -3523,6 +3523,7 @@ function browseQuery(query: unknown): BrowseQuery {
   return {
     includeItemTypes: value.IncludeItemTypes ?? value.includeItemTypes,
     mediaTypes: value.MediaTypes ?? value.mediaTypes,
+    searchTerm: value.SearchTerm ?? value.searchTerm,
     parentId: value.ParentId ?? value.parentId,
     recursive: booleanQuery(value.Recursive ?? value.recursive),
     genres: value.Genres ?? value.genres,

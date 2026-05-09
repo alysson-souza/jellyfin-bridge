@@ -2308,6 +2308,15 @@ test("serves indexed items as merged bridge items", async () => {
   assert.equal(items.json().Items[0].Id, alienBridgeId);
   assert.equal(items.json().Items[0].UserData.IsFavorite, true);
 
+  const searchedItems = await app.inject({
+    method: "GET",
+    url: `/Users/${auth.User.Id}/Items?Recursive=true&IncludeItemTypes=Movie&SearchTerm=thing`,
+    headers: { "X-MediaBrowser-Token": token }
+  });
+  assert.equal(searchedItems.statusCode, 200);
+  assert.equal(searchedItems.json().TotalRecordCount, 1);
+  assert.deepEqual(searchedItems.json().Items.map((item: any) => item.Name), ["The Thing"]);
+
   const lowerCasePagedItems = await app.inject({
     method: "GET",
     url: "/Items?recursive=true&includeItemTypes=Movie&startIndex=1&limit=1",
