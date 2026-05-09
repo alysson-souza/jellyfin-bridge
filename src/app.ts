@@ -41,6 +41,7 @@ interface LiveCandidate {
 }
 
 type LiveQueryParams = Record<string, string | number | boolean | undefined>;
+type MetadataBrowseType = "Genre" | "Studio";
 
 interface RawProxyCandidate {
   serverId: string;
@@ -330,14 +331,14 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.get("/Items", async (request) => {
     const auth = requireSession(request, config, store);
     const query = browseQuery(request.query);
-    return browseItems(auth.user.name, auth.session.userId, query);
+    return browseItems(auth.user.name, auth.session.userId, query, request.query, request);
   });
   app.get("/Users/:userId/Items", async (request) => {
     const auth = requireSession(request, config, store);
     const params = request.params as { userId: string };
     const userIdValue = requireSelf(auth, params.userId);
     const query = browseQuery(request.query);
-    return browseItems(auth.user.name, userIdValue, query);
+    return browseItems(auth.user.name, userIdValue, query, request.query, request);
   });
   app.get("/Items/Latest", async (request) => {
     const auth = requireSession(request, config, store);
@@ -438,6 +439,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.get("/Genres", async (request) => {
     const auth = requireSession(request, config, store);
     const query = metadataQuery(request.query);
+    if (liveRouteAggregation) {
+      const live = await liveMetadataResult(auth.user.name, "/Genres", "Genre", request.query, request);
+      if (live) return live;
+    }
     const items = listGenres(config, store, auth.session.userId, query);
     return queryResult(items, query.startIndex ?? 0);
   });
@@ -481,6 +486,10 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.get("/Studios", async (request) => {
     const auth = requireSession(request, config, store);
     const query = metadataQuery(request.query);
+    if (liveRouteAggregation) {
+      const live = await liveMetadataResult(auth.user.name, "/Studios", "Studio", request.query, request);
+      if (live) return live;
+    }
     const items = listStudios(config, store, auth.session.userId, query);
     return queryResult(items, query.startIndex ?? 0);
   });
@@ -843,7 +852,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   app.all("/*", async (_request, reply) => notFound(reply));
   return app;
 
-  async function browseItems(userName: string, userIdValue: string, query: BrowseQuery): Promise<Record<string, unknown>> {
+  async function browseItems(userName: string, userIdValue: string, query: BrowseQuery, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>> {
     const snapshotConfig = config;
     const snapshotServerId = serverId;
     const client = upstream;
@@ -857,6 +866,12 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
     let result = queryBridgeItems(snapshotConfig, store, userIdValue, query);
     if (result.total === 0) {
+      if (liveRouteAggregation) {
+        return await liveBrowseResult(userIdValue, rawQuery, request).catch((error: unknown) => {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw badGatewayError(`Upstream browse failed: ${detail}`);
+        });
+      }
       await refreshLiveBrowse(snapshotConfig, client, query).catch((error: unknown) => {
         const detail = error instanceof Error ? error.message : String(error);
         throw badGatewayError(`Upstream browse failed: ${detail}`);
@@ -864,6 +879,66 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       result = queryBridgeItems(snapshotConfig, store, userIdValue, query);
     }
     return queryResult(result.items, query.startIndex ?? 0, result.total);
+  }
+
+  async function liveBrowseResult(userIdValue: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown>> {
+    const client = upstream;
+    const bridgeServerIdValue = serverId;
+    const sources = liveQuerySources("/Items", rawQuery);
+    logUpstreamFanout(request, "/Items", "/Items", sources);
+    const candidates: LiveCandidate[] = [];
+    const indexedItems: IndexedItemRecord[] = [];
+    let sawResponse = false;
+
+    await Promise.all(sources.map(async (source) => {
+      const query = aggregateLivePageQuery(rawQuery, liveBrowseQueryForSource(rawQuery, source));
+      try {
+        logUpstreamJson(request, "/Items", source, "/Items");
+        const response = await client.json<unknown>(source.serverId, "/Items", { query });
+        sawResponse = true;
+        for (const item of liveItemsFromResponse(response)) {
+          const indexed = upsertLiveItem(source, item);
+          if (indexed) indexedItems.push(indexed);
+          candidates.push({ source, item: indexed?.json ?? item });
+        }
+      } catch (error) {
+        if (!isIgnorableLiveSourceError(error)) throw error;
+      }
+    }));
+
+    if (!sawResponse) throw new Error("No upstream response for /Items");
+    if (indexedItems.length > 0) {
+      const allowedSourceKeys = new Set(sources
+        .filter((source): source is LiveSource & { libraryId: string } => typeof source.libraryId === "string")
+        .map((source) => `${source.serverId}:${source.libraryId}`));
+      const query = browseQuery(rawQuery);
+      const result = queryBridgeItemsFromIndexedItems(
+        config,
+        store,
+        userIdValue,
+        indexedItems,
+        query,
+        (item) => allowedSourceKeys.has(`${item.serverId}:${item.libraryId}`)
+      );
+      return queryResult(result.items, query.startIndex ?? 0, result.total);
+    }
+    const startIndex = startIndexFrom(rawQuery) ?? 0;
+    const limit = limitFrom(rawQuery);
+    const merged = mergeLiveCandidates(candidates);
+    const paged = limit === undefined ? merged.slice(startIndex) : merged.slice(startIndex, startIndex + limit);
+    return queryResult(paged.map((candidate) => scopedLiveDto(candidate, userIdValue, bridgeServerIdValue)), startIndex, merged.length);
+  }
+
+  function liveBrowseQueryForSource(rawQuery: unknown, source: LiveSource): LiveQueryParams {
+    const query = stripBridgeUserQuery(rawQuery);
+    if (parentIdFrom(rawQuery)) {
+      rewriteParentIdForSource(query, rawQuery, source);
+    } else if (source.libraryId) {
+      delete query.parentId;
+      query.ParentId = source.libraryId;
+    }
+    rewriteSeriesIdForSource(query, rawQuery, source);
+    return query;
   }
 
   async function refreshLiveBrowse(snapshotConfig: BridgeConfig, client: AppUpstreamClient, query: BrowseQuery): Promise<void> {
@@ -1023,6 +1098,56 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     const paged = limit === undefined ? merged.slice(startIndex) : merged.slice(startIndex, startIndex + limit);
     const total = Math.max(merged.length, upstreamTotalRecordCount);
     return queryResult(paged.map((candidate) => scopedLiveDto(candidate, userIdValue, bridgeServerIdValue)), startIndex, total);
+  }
+
+  async function liveMetadataResult(userName: string, path: "/Genres" | "/Studios", type: MetadataBrowseType, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown> | undefined> {
+    const client = upstream;
+    const cacheVersion = configVersion;
+    const sources = liveLibrarySources(rawQuery);
+    logUpstreamFanout(request, path, path, sources);
+    const names = new Map<string, string>();
+    let sawResponse = false;
+
+    await Promise.all(sources.map(async (source) => {
+      const query = aggregateLivePageQuery(rawQuery, await liveMetadataQueryForSource(client, cacheVersion, userName, rawQuery, source));
+      try {
+        logUpstreamJson(request, path, source, path);
+        const response = await client.json<unknown>(source.serverId, path, { query });
+        sawResponse = true;
+        for (const item of liveItemsFromResponse(response)) {
+          const name = typeof item.Name === "string" ? item.Name.trim() : "";
+          const key = name.toLowerCase();
+          if (name && !names.has(key)) names.set(key, name);
+        }
+      } catch (error) {
+        if (!isIgnorableLiveSourceError(error)) throw error;
+      }
+    }));
+
+    if (!sawResponse) return undefined;
+    const merged = Array.from(names.values())
+      .sort((left, right) => left.localeCompare(right))
+      .map((name) => findMetadataItem(config, name, type));
+    const startIndex = startIndexFrom(rawQuery) ?? 0;
+    const limit = limitFrom(rawQuery);
+    const paged = limit === undefined ? merged.slice(startIndex) : merged.slice(startIndex, startIndex + limit);
+    return queryResult(paged, startIndex, merged.length);
+  }
+
+  async function liveMetadataQueryForSource(
+    client: AppUpstreamClient,
+    cacheVersion: number,
+    userName: string,
+    rawQuery: unknown,
+    source: LiveSource
+  ): Promise<LiveQueryParams> {
+    const query = stripBridgeUserQuery(rawQuery);
+    rewriteParentIdForSource(query, rawQuery, source);
+    const upstreamUserId = await liveUserId(client, cacheVersion, source.serverId, userName);
+    if (upstreamUserId) {
+      query.UserId = upstreamUserId;
+    }
+    return query;
   }
 
   async function getLiveItem(userName: string, itemIdValue: string, rawQuery: unknown, request?: FastifyRequest): Promise<Record<string, unknown> | undefined> {

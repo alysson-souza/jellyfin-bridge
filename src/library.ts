@@ -48,9 +48,10 @@ export function queryBridgeItemsFromIndexedItems(
   store: Store,
   userId: string,
   indexedItems: IndexedItemRecord[],
-  query: BrowseQuery = {}
+  query: BrowseQuery = {},
+  inScope: (item: IndexedItemRecord) => boolean = () => true
 ): BridgeItemsResult {
-  return queryBridgeItemGroups(config, store, userId, completeSourceGroups(store, indexedItems), query);
+  return queryBridgeItemGroups(config, store, userId, completeSourceGroups(store, indexedItems, inScope), query);
 }
 
 export function countBridgeItemsFromIndexedItems(
