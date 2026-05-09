@@ -545,7 +545,7 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
       episodes = listBridgeItemsForSourceParents(snapshotConfig, store, auth.session.userId, episodeParentSources, ["Episode"])
         .filter((item) => seasonNumber === undefined || String(item.ParentIndexNumber) === seasonNumber);
     }
-    return pagedQueryResult(episodes, browseQuery(request.query));
+    return pagedQueryResult(sortShowEpisodes(episodes, seasonSources), browseQuery(request.query));
   });
 
   app.get("/Shows/NextUp", async (request) => {
@@ -963,8 +963,8 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         sawResponse = true;
         for (const item of liveItemsFromResponse(response)) {
           await ensureRelatedLiveItems(client, cacheVersion, userName, source, item);
-          upsertLiveItem(source, item);
-          candidates.push({ source, item });
+          const indexed = upsertLiveItem(source, item);
+          candidates.push({ source, item: indexed?.json ?? item });
         }
       } catch (error) {
         if (!isIgnorableLiveSourceError(error)) throw error;
@@ -1000,11 +1000,12 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
         const items = liveItemsFromResponse(response);
         upstreamTotalRecordCount += total;
         for (const item of items) {
+          let candidateItem = item;
           if (source.libraryId) {
             await ensureRelatedLiveItems(client, cacheVersion, userName, source, item);
-            upsertLiveItem(source, item);
+            candidateItem = upsertLiveItem(source, item)?.json ?? item;
           }
-          candidates.push({ source, item });
+          candidates.push({ source, item: candidateItem });
         }
       } catch (error) {
         if (!isIgnorableLiveSourceError(error)) throw error;
@@ -1444,16 +1445,29 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
     }
   }
 
-  function upsertLiveItem(source: LiveSource, item: Record<string, unknown>): void {
-    if (!source.libraryId || typeof item.Id !== "string") return;
-    store.upsertIndexedItem({
+  function upsertLiveItem(source: LiveSource, item: Record<string, unknown>): IndexedItemRecord | undefined {
+    if (!source.libraryId || typeof item.Id !== "string") return undefined;
+    const existing = store.findIndexedItemsBySourceId(item.Id)
+      .find((candidate) => candidate.serverId === source.serverId && candidate.libraryId === source.libraryId);
+    const json = existing ? mergeLiveItemJson(existing.json, item) : item;
+    const indexed = {
       serverId: source.serverId,
       itemId: item.Id,
       libraryId: source.libraryId,
-      itemType: typeof item.Type === "string" ? item.Type : "Unknown",
-      logicalKey: logicalItemKey(item as unknown as SourceItem, source.serverId),
-      json: item
-    });
+      itemType: typeof json.Type === "string" ? json.Type : existing?.itemType ?? "Unknown",
+      logicalKey: logicalItemKey(json as unknown as SourceItem, source.serverId),
+      json
+    };
+    store.upsertIndexedItem(indexed);
+    return indexed;
+  }
+
+  function mergeLiveItemJson(existing: Record<string, unknown>, incoming: Record<string, unknown>): Record<string, unknown> {
+    const merged = { ...existing, ...incoming };
+    if (isRecord(existing.ProviderIds) && isRecord(incoming.ProviderIds)) {
+      merged.ProviderIds = { ...existing.ProviderIds, ...incoming.ProviderIds };
+    }
+    return merged;
   }
 
   async function ensureRelatedLiveItems(client: AppUpstreamClient, cacheVersion: number, userName: string, source: LiveSource, item: Record<string, unknown>): Promise<void> {
@@ -2063,6 +2077,37 @@ export function buildApp(dependencies: AppDependencies): FastifyInstance {
   function pagedQueryResult(items: Record<string, unknown>[], query: Pick<BrowseQuery, "startIndex" | "limit">): Record<string, unknown> {
     const start = query.startIndex ?? 0;
     return queryResult(items.slice(start, query.limit === undefined ? undefined : start + query.limit), start, items.length);
+  }
+
+  function sortShowEpisodes(items: Record<string, unknown>[], seasonSources: IndexedItemRecord[]): Record<string, unknown>[] {
+    const selectedSeason = seasonSources[0];
+    if (selectedSeason && isZeroIndex(selectedSeason.json.IndexNumber)) {
+      return [...items].sort(compareBySortName);
+    }
+    return [...items].sort(compareByEpisodeOrder);
+  }
+
+  function compareByEpisodeOrder(left: Record<string, unknown>, right: Record<string, unknown>): number {
+    return compareOptionalNumber(left.ParentIndexNumber, right.ParentIndexNumber)
+      || compareOptionalNumber(left.IndexNumber, right.IndexNumber)
+      || compareBySortName(left, right);
+  }
+
+  function compareBySortName(left: Record<string, unknown>, right: Record<string, unknown>): number {
+    return String(left.SortName ?? left.Name ?? "").localeCompare(String(right.SortName ?? right.Name ?? ""));
+  }
+
+  function compareOptionalNumber(left: unknown, right: unknown): number {
+    return numericSortValue(left) - numericSortValue(right);
+  }
+
+  function numericSortValue(value: unknown): number {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (typeof value === "string" && value.trim() !== "") {
+      const parsed = Number(value);
+      if (Number.isFinite(parsed)) return parsed;
+    }
+    return Number.MAX_SAFE_INTEGER;
   }
 
   function canWriteUserData(userIdValue: string, itemIdValue: string): boolean {

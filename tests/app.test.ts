@@ -4535,6 +4535,71 @@ test("cached show season and episode routes use targeted indexed children", asyn
   store.close();
 });
 
+test("cached show episode routes keep regular seasons in episode order", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "shows-lib",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "series-a", Type: "Series", Name: "Example Series", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-a",
+    libraryId: "shows-lib",
+    itemType: "Season",
+    logicalKey: "season:series:series-a:season:1",
+    json: { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", IndexNumber: 1 }
+  });
+  for (const episode of [
+    { id: "episode-a", name: "Zeta Pilot", index: 1 },
+    { id: "episode-b", name: "Alpha Follow-up", index: 2 },
+    { id: "episode-c", name: "Middle Finale", index: 10 }
+  ]) {
+    store.upsertIndexedItem({
+      serverId: "main",
+      itemId: episode.id,
+      libraryId: "shows-lib",
+      itemType: "Episode",
+      logicalKey: `episode:series:series-a:season:1:episode:${episode.index}`,
+      json: {
+        Id: episode.id,
+        Type: "Episode",
+        Name: episode.name,
+        SeriesId: "series-a",
+        SeasonId: "season-a",
+        ParentIndexNumber: 1,
+        IndexNumber: episode.index
+      }
+    });
+  }
+  const app = buildApp({ config, store });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const seriesId = bridgeItemId("series:tvdb:100");
+  const seasonId = bridgeItemId("season:series:series-a:season:1");
+
+  const episodes = await app.inject({
+    method: "GET",
+    url: `/Shows/${seriesId}/Episodes?userId=${login.json().User.Id}&SeasonId=${seasonId}&limit=200`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(episodes.statusCode, 200);
+  assert.deepEqual(episodes.json().Items.map((item: any) => item.Name), ["Zeta Pilot", "Alpha Follow-up", "Middle Finale"]);
+
+  await app.close();
+  store.close();
+});
+
 test("cached show child routes preserve priority source selection after type narrowing", async () => {
   const passwordHash = await hash("secret");
   const config: BridgeConfig = {
@@ -4697,6 +4762,88 @@ test("indexes parent-scoped live next-up items before returning bridge ids", asy
   });
   assert.equal(seasons.statusCode, 200);
   assert.deepEqual(seasons.json().Items.map((item: any) => item.Name), ["Season 1"]);
+
+  await app.close();
+  store.close();
+});
+
+test("live next-up preserves existing indexed episode identity when upstream omits provider fields", async () => {
+  const passwordHash = await hash("secret");
+  const config: BridgeConfig = {
+    server: { bind: "127.0.0.1", port: 8096, publicUrl: "http://bridge.test", name: "Bridge" },
+    auth: { users: [{ name: "alice", passwordHash }] },
+    upstreams: [{ id: "main", name: "Main", url: "https://main.example.com", token: "token" }],
+    libraries: [{ id: "shows", name: "Shows", collectionType: "tvshows", sources: [{ server: "main", libraryId: "shows-lib" }] }]
+  };
+  const upstream = new FakeUpstream({
+    "main:/Users": [{ Id: "main-user", Name: "alice" }],
+    "main:/Shows/NextUp": {
+      Items: [{
+        Id: "episode-a",
+        Type: "Episode",
+        Name: "Pilot",
+        SeriesId: "series-a",
+        SeasonId: "season-a",
+        ParentIndexNumber: 1,
+        IndexNumber: 1
+      }],
+      TotalRecordCount: 1,
+      StartIndex: 0
+    }
+  });
+  const store = new Store(":memory:");
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "series-a",
+    libraryId: "shows-lib",
+    itemType: "Series",
+    logicalKey: "series:tvdb:100",
+    json: { Id: "series-a", Type: "Series", Name: "Example Series", ProviderIds: { Tvdb: "100" } }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "season-a",
+    libraryId: "shows-lib",
+    itemType: "Season",
+    logicalKey: "season:tvdb:200",
+    json: { Id: "season-a", Type: "Season", Name: "Season 1", SeriesId: "series-a", ProviderIds: { Tvdb: "200" }, IndexNumber: 1 }
+  });
+  store.upsertIndexedItem({
+    serverId: "main",
+    itemId: "episode-a",
+    libraryId: "shows-lib",
+    itemType: "Episode",
+    logicalKey: "episode:tvdb:300",
+    json: {
+      Id: "episode-a",
+      Type: "Episode",
+      Name: "Pilot",
+      SortName: "001 - 0001 - Pilot",
+      Path: "/media/show/episode-a.mkv",
+      ParentId: "season-a",
+      SeriesId: "series-a",
+      SeasonId: "season-a",
+      ParentIndexNumber: 1,
+      IndexNumber: 1,
+      ProviderIds: { Tvdb: "300" },
+      MediaSources: [{ Id: "episode-a-source", Path: "/media/show/episode-a.mkv" }]
+    }
+  });
+  const app = buildApp({ config, store, upstream });
+  const login = await app.inject({ method: "POST", url: "/Users/AuthenticateByName", payload: { Username: "alice", Pw: "secret" } });
+  const stableEpisodeId = bridgeItemId("episode:tvdb:300");
+
+  const nextUp = await app.inject({
+    method: "GET",
+    url: `/Shows/NextUp?userId=${login.json().User.Id}&ParentId=${bridgeLibraryId("shows")}&SeriesId=${bridgeItemId("series:tvdb:100")}&Limit=1`,
+    headers: { "X-MediaBrowser-Token": login.json().AccessToken }
+  });
+
+  assert.equal(nextUp.statusCode, 200);
+  assert.equal(nextUp.json().Items[0].Id, stableEpisodeId);
+  assert.equal(nextUp.json().Items[0].ProviderIds.Tvdb, "300");
+  assert.equal(nextUp.json().Items[0].Path, "/media/show/episode-a.mkv");
+  assert.equal(store.findIndexedItemsBySourceId("episode-a")[0]?.logicalKey, "episode:tvdb:300");
 
   await app.close();
   store.close();
